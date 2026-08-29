@@ -1,0 +1,7 @@
+architecture,dropout_rate,blocks,planned_executions,mask_rule,primary_role
+Streaming variational DPMM,0.00,100,100,nested within recorded block,low-latency approximation
+Streaming variational DPMM,0.15,100,100,nested within recorded block,low-latency approximation
+Streaming variational DPMM,0.30,100,100,nested within recorded block,low-latency approximation
+Collapsed DP-SMC,0.00,100,100,nested within recorded block,posterior reference
+Collapsed DP-SMC,0.15,100,100,nested within recorded block,posterior reference
+Collapsed DP-SMC,0.30,100,100,nested within recorded block,posterior reference

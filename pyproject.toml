@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opensky-streaming-dpmm"
+version = "1.0.0"
+description = "Topology-aware streaming Bayesian nonparametric clustering of OpenSky aircraft kinematics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Salem Morelli"}]
+dependencies = [
+  "numpy>=1.26,<3",
+  "scipy>=1.11,<2",
+  "requests>=2.31,<3",
+  "torch>=2.2,<3",
+]
+
+[project.optional-dependencies]
+report = ["matplotlib>=3.8,<4", "reportlab>=4.0,<6", "pypdf>=5.0,<7"]
+test = ["pytest>=8,<9"]
+
+[project.scripts]
+opensky-dpmm = "opensky_streaming_dpmm.engine:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

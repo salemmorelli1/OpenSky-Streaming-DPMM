@@ -1,0 +1,17 @@
+{
+  "project": "OpenSky Streaming DPMM",
+  "version": "1.0.0",
+  "status": "methodology_complete_empirical_benchmark_pending",
+  "data_source": "OpenSky Network state vectors",
+  "observation_space": "R^2 x S^1",
+  "methods": [
+    "Truncated streaming variational Dirichlet-process mixture",
+    "Collapsed Dirichlet-process sequential Monte Carlo with Gibbs rejuvenation"
+  ],
+  "factorial_cells": 6,
+  "planned_blocks": 100,
+  "planned_executions": 600,
+  "dropout_rates": [0.0, 0.15, 0.3],
+  "empirical_results_available": false,
+  "claim_boundary": "No radar-pulse, emitter-identification, ELINT, SIGINT, or operational performance claim."
+}

@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this research software, please cite it using this metadata."
+title: "OpenSky Streaming DPMM: Topology-Aware Bayesian Nonparametric Clustering"
+type: software
+authors:
+  - family-names: Morelli
+    given-names: Salem
+version: 1.0.0
+date-released: 2026-08-29
+license: MIT
+repository-code: "https://github.com/salemmorelli1/OpenSky-Streaming-DPMM"
+url: "https://salemmorelli1.github.io/OpenSky-Streaming-DPMM/"
+keywords:
+  - Bayesian nonparametrics
+  - Dirichlet process mixture
+  - circular statistics
+  - streaming inference
+  - OpenSky Network
