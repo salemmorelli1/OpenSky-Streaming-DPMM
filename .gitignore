@@ -16,3 +16,8 @@ site-preview.png
 *.parquet
 *.pt
 *.pth
+
+# Local credentials
+.env.local
+credentials.json
+credentials*.json
