@@ -1,0 +1,392 @@
+"""Restartable, privacy-minimized OpenSky acquisition for empirical blocks.
+
+The collector intentionally does not import PyTorch.  Acquisition therefore
+remains available when an enterprise Windows policy temporarily prevents a
+numerical backend DLL from loading.  OAuth credentials are read from process
+environment variables and are never serialized.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+import requests
+
+
+API_URL = "https://opensky-network.org/api/states/all"
+TOKEN_URL = (
+    "https://auth.opensky-network.org/auth/realms/opensky-network/"
+    "protocol/openid-connect/token"
+)
+SCHEMA_VERSION = "opensky-empirical-block-v1"
+DEFAULT_BBOX = (49.0, 7.0, 54.0, 13.0)
+
+
+class CollectionError(RuntimeError):
+    """Raised when a block cannot be collected or verified."""
+
+
+@dataclass(frozen=True)
+class CollectionConfig:
+    phase: str
+    bbox: tuple[float, float, float, float]
+    snapshots_per_block: int
+    interval_seconds: float
+    minimum_eligible_states: int
+
+    def __post_init__(self) -> None:
+        if self.phase not in {"calibration", "formal"}:
+            raise ValueError("phase must be calibration or formal")
+        lamin, lomin, lamax, lomax = self.bbox
+        if not (-90 <= lamin < lamax <= 90 and -180 <= lomin < lomax <= 180):
+            raise ValueError("bbox must be (lamin, lomin, lamax, lomax)")
+        if self.snapshots_per_block < 2:
+            raise ValueError("a streaming block requires at least two snapshots")
+        if self.interval_seconds < 0 or self.minimum_eligible_states < 1:
+            raise ValueError("invalid timing or eligibility threshold")
+
+
+class OAuthSession:
+    """Minimal OAuth2 client with rate-limit-aware requests."""
+
+    def __init__(
+        self,
+        client_id: str | None,
+        client_secret: str | None,
+        timeout_seconds: float = 20.0,
+        session: requests.Session | None = None,
+    ) -> None:
+        if (client_id is None) != (client_secret is None):
+            raise ValueError("provide both OpenSky OAuth values or neither")
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.timeout_seconds = timeout_seconds
+        self.session = session or requests.Session()
+        self._token: str | None = None
+        self._expires_at = 0.0
+
+    def _headers(self) -> dict[str, str]:
+        if self.client_id is None:
+            return {}
+        if self._token is None or time.time() >= self._expires_at - 30.0:
+            response = self.session.post(
+                TOKEN_URL,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                },
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            self._token = str(payload["access_token"])
+            self._expires_at = time.time() + float(payload.get("expires_in", 1800))
+        return {"Authorization": f"Bearer {self._token}"}
+
+    def get_states(
+        self, bbox: tuple[float, float, float, float]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        lamin, lomin, lamax, lomax = bbox
+        started = time.perf_counter()
+        response = self.session.get(
+            API_URL,
+            params={
+                "lamin": lamin,
+                "lomin": lomin,
+                "lamax": lamax,
+                "lomax": lomax,
+                "extended": 1,
+            },
+            headers=self._headers(),
+            timeout=self.timeout_seconds,
+        )
+        elapsed_ms = 1000.0 * (time.perf_counter() - started)
+        if response.status_code == 429:
+            retry = response.headers.get(
+                "X-Rate-Limit-Retry-After-Seconds",
+                response.headers.get("Retry-After", "unknown"),
+            )
+            raise CollectionError(f"OpenSky rate limit reached; retry after {retry} s")
+        response.raise_for_status()
+        metadata = {
+            "network_latency_ms": elapsed_ms,
+            "rate_limit_remaining": _safe_int(
+                response.headers.get("X-Rate-Limit-Remaining")
+            ),
+            "rate_limit_retry_after_seconds": _safe_int(
+                response.headers.get("X-Rate-Limit-Retry-After-Seconds")
+            ),
+        }
+        return response.json(), metadata
+
+
+def _safe_int(value: str | None) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def load_or_create_salt(path: Path) -> bytes:
+    """Create a stable local pseudonym key with owner-only permissions."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        salt = path.read_bytes()
+        if len(salt) < 32:
+            raise CollectionError("pseudonym salt is shorter than 32 bytes")
+        return salt
+    salt = secrets.token_bytes(32)
+    descriptor, temporary = tempfile.mkstemp(prefix=path.name, dir=path.parent)
+    try:
+        os.write(descriptor, salt)
+        os.close(descriptor)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        Path(temporary).unlink(missing_ok=True)
+        raise
+    return salt
+
+
+def pseudonymize(icao24: str, salt: bytes) -> str:
+    return hmac.new(salt, icao24.encode("ascii"), hashlib.sha256).hexdigest()[:24]
+
+
+def sanitize_payload(payload: dict[str, Any], salt: bytes) -> dict[str, Any]:
+    """Remove direct identity fields before any block is written to disk."""
+
+    observations: list[dict[str, Any]] = []
+    rejected = 0
+    for row in payload.get("states") or []:
+        if len(row) < 12:
+            rejected += 1
+            continue
+        icao24, velocity, track, vertical_rate = row[0], row[9], row[10], row[11]
+        if None in (icao24, velocity, track, vertical_rate):
+            rejected += 1
+            continue
+        if float(velocity) < 0:
+            rejected += 1
+            continue
+        observations.append(
+            {
+                "track_key": pseudonymize(str(icao24), salt),
+                "time_position": row[3],
+                "last_contact": row[4],
+                "longitude": row[5],
+                "latitude": row[6],
+                "baro_altitude": row[7],
+                "on_ground": row[8],
+                "velocity": float(velocity),
+                "true_track": float(track) % 360.0,
+                "vertical_rate": float(vertical_rate),
+                "geo_altitude": row[13] if len(row) > 13 else None,
+                "position_source": row[16] if len(row) > 16 else None,
+                "category": row[17] if len(row) > 17 else None,
+            }
+        )
+    return {
+        "api_time": int(payload.get("time", time.time())),
+        "eligible_observations": len(observations),
+        "rejected_incomplete_states": rejected,
+        "observations": observations,
+    }
+
+
+def atomic_write_gzip_json(path: Path, value: dict[str, Any]) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canonical = canonical_json_bytes(value)
+    digest = sha256_bytes(canonical)
+    descriptor, temporary = tempfile.mkstemp(prefix=path.name, dir=path.parent)
+    os.close(descriptor)
+    try:
+        with Path(temporary).open("wb") as raw_stream:
+            with gzip.GzipFile(
+                filename="", mode="wb", fileobj=raw_stream, mtime=0
+            ) as stream:
+                stream.write(canonical)
+        os.replace(temporary, path)
+    except Exception:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+    return digest
+
+
+def read_verified_block(path: Path) -> dict[str, Any]:
+    with gzip.open(path, "rb") as stream:
+        data = stream.read()
+    value = json.loads(data)
+    expected = value.get("integrity", {}).get("content_sha256")
+    if not expected:
+        raise CollectionError(f"missing content checksum: {path}")
+    copy = dict(value)
+    copy["integrity"] = dict(value["integrity"])
+    copy["integrity"].pop("content_sha256", None)
+    actual = sha256_bytes(canonical_json_bytes(copy))
+    if not hmac.compare_digest(expected, actual):
+        raise CollectionError(f"checksum mismatch: {path}")
+    return value
+
+
+def build_block(
+    client: OAuthSession,
+    config: CollectionConfig,
+    salt: bytes,
+    block_id: str,
+) -> dict[str, Any]:
+    snapshots: list[dict[str, Any]] = []
+    raw_hashes: list[str] = []
+    for index in range(config.snapshots_per_block):
+        raw, transport = client.get_states(config.bbox)
+        raw_hashes.append(sha256_bytes(canonical_json_bytes(raw)))
+        sanitized = sanitize_payload(raw, salt)
+        if sanitized["eligible_observations"] < config.minimum_eligible_states:
+            raise CollectionError(
+                f"{block_id} snapshot {index} has only "
+                f"{sanitized['eligible_observations']} eligible states"
+            )
+        sanitized["snapshot_index"] = index
+        sanitized["transport"] = transport
+        snapshots.append(sanitized)
+        if index + 1 < config.snapshots_per_block and config.interval_seconds:
+            time.sleep(config.interval_seconds)
+
+    block: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "block_id": block_id,
+        "phase": config.phase,
+        "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "OpenSky Network /api/states/all",
+        "bbox": list(config.bbox),
+        "snapshots_per_block": config.snapshots_per_block,
+        "interval_seconds": config.interval_seconds,
+        "identity_policy": (
+            "ICAO24 transformed by a local keyed HMAC; callsign, origin country, "
+            "squawk, and raw ICAO24 are discarded before serialization."
+        ),
+        "snapshots": snapshots,
+        "integrity": {
+            "raw_response_sha256": raw_hashes,
+            "content_sha256": None,
+        },
+    }
+    integrity_input = dict(block)
+    integrity_input["integrity"] = dict(block["integrity"])
+    integrity_input["integrity"].pop("content_sha256")
+    block["integrity"]["content_sha256"] = sha256_bytes(
+        canonical_json_bytes(integrity_input)
+    )
+    return block
+
+
+def collect_blocks(
+    output_dir: Path,
+    count: int,
+    config: CollectionConfig,
+    spacing_seconds: float,
+    start_index: int = 1,
+    client: OAuthSession | None = None,
+    salt_path: Path | None = None,
+) -> list[Path]:
+    """Collect missing block indices and verify every completed artifact."""
+
+    if count < 1 or start_index < 1 or spacing_seconds < 0:
+        raise ValueError("invalid block count, start index, or spacing")
+    client = client or OAuthSession(
+        os.getenv("OPENSKY_CLIENT_ID"), os.getenv("OPENSKY_CLIENT_SECRET")
+    )
+    salt = load_or_create_salt(
+        salt_path or Path("data/private/pseudonym_salt.bin")
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    completed: list[Path] = []
+    indices = range(start_index, start_index + count)
+    for offset, block_index in enumerate(indices):
+        block_id = f"{config.phase}-{block_index:04d}"
+        destination = output_dir / f"{block_id}.json.gz"
+        if destination.exists():
+            read_verified_block(destination)
+            completed.append(destination)
+            continue
+        block = build_block(client, config, salt, block_id)
+        atomic_write_gzip_json(destination, block)
+        read_verified_block(destination)
+        completed.append(destination)
+        if offset + 1 < count and spacing_seconds:
+            time.sleep(spacing_seconds)
+    return completed
+
+
+def iter_verified_blocks(directory: Path, phase: str) -> Iterable[Path]:
+    for path in sorted(directory.glob(f"{phase}-*.json.gz")):
+        read_verified_block(path)
+        yield path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Collect restartable, pseudonymized OpenSky streaming blocks"
+    )
+    parser.add_argument("--output", type=Path, default=Path("data/recorded_blocks"))
+    parser.add_argument("--phase", choices=["calibration", "formal"], required=True)
+    parser.add_argument("--blocks", type=int, required=True)
+    parser.add_argument("--start-index", type=int, default=1)
+    parser.add_argument("--snapshots-per-block", type=int, default=6)
+    parser.add_argument("--interval-seconds", type=float, default=5.0)
+    parser.add_argument("--spacing-seconds", type=float, default=60.0)
+    parser.add_argument("--minimum-eligible-states", type=int, default=32)
+    parser.add_argument(
+        "--bbox",
+        nargs=4,
+        type=float,
+        metavar=("LAMIN", "LOMIN", "LAMAX", "LOMAX"),
+        default=DEFAULT_BBOX,
+    )
+    args = parser.parse_args()
+    config = CollectionConfig(
+        phase=args.phase,
+        bbox=tuple(args.bbox),
+        snapshots_per_block=args.snapshots_per_block,
+        interval_seconds=args.interval_seconds,
+        minimum_eligible_states=args.minimum_eligible_states,
+    )
+    paths = collect_blocks(
+        args.output,
+        args.blocks,
+        config,
+        args.spacing_seconds,
+        args.start_index,
+    )
+    print(json.dumps({"completed": len(paths), "last": str(paths[-1])}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

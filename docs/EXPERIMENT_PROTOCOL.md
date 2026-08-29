@@ -18,7 +18,7 @@ The benchmark is a 2 by 3 crossed repeated-measures randomized-block design:
 
 - Architecture: streaming variational DPMM versus collapsed DP-SMC.
 - Observation thinning: 0%, 15%, and 30%.
-- Blocks: 100 independently recorded OpenSky snapshots or short windows.
+- Blocks: 100 separately scheduled OpenSky short streaming windows.
 - Total planned executions: 600.
 
 Each block is recorded once and replayed through all six cells. One deterministic
@@ -36,10 +36,11 @@ aircraft identifiers are neither features nor public report fields.
 
 ## Outcomes
 
-Primary outcomes are adjusted mutual information or normalized mutual
-information against evaluation-only categories when label coverage is adequate,
-prequential log score, synchronized compute latency, and posterior cluster-count
-stability. SMC particle ESS is an algorithmic health measure; rank-normalized
+Primary outcomes are mean prequential log score, synchronized compute latency
+per retained observation, and posterior cluster-count stability. Normalized
+mutual information against evaluation-only OpenSky categories is secondary
+because category coverage is incomplete and the field is not a behavioral
+ground truth. SMC particle ESS is an algorithmic health measure; rank-normalized
 split R-hat and bulk ESS apply only to genuine independently initialized MCMC
 traces used in sensitivity analysis.
 
@@ -67,3 +68,13 @@ field-level missingness are not treatment. Blocks failing the preregistered
 minimum-completeness threshold are excluded before method execution and logged
 with a reason. Network latency is reported separately from synchronized model
 compute time.
+
+## Execution lock
+
+Ten calibration blocks are excluded from all formal contrasts. They select the
+smallest truncation in the fixed grid whose 95th-percentile residual-component
+weight is at most 0.01 and whose boundary-saturation rate is at most 0.05. The
+resulting lock records block hashes, \(K\), particle count, rejuvenation window,
+seeds, treatment levels, and endpoints. Formal execution requires exactly 100
+checksum-verified blocks and the public analyzer requires exactly 600 unique
+method-by-thinning rows.

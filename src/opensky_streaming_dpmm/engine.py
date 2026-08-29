@@ -334,6 +334,49 @@ class StreamingCircularDPMM:
         logits = logits + self.expected_log_weights()[None, :]
         return torch.softmax(logits, dim=1)
 
+    def log_predictive(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        """Approximate held-forward posterior predictive log density.
+
+        Evaluate this before the corresponding streaming update.  The
+        Euclidean term is the Normal-Gamma Student-t predictive and the
+        directional term integrates the von Mises likelihood against its
+        posterior on the circle.  Components are averaged with the residual-
+        stick posterior mean weights.
+        """
+
+        if not self.initialized:
+            raise RuntimeError("call initialize on a calibration batch first")
+        degrees = 2.0 * self.post_a
+        scale = torch.sqrt(
+            self.post_b * (self.post_kappa + 1.0)
+            / (self.post_a * self.post_kappa)
+        )
+        euclidean = torch.distributions.StudentT(
+            degrees[None, :, :],
+            self.post_mean[None, :, :],
+            scale[None, :, :],
+        ).log_prob(x[:, None, :]).sum(dim=2)
+
+        unit = torch.stack([torch.cos(theta), torch.sin(theta)], dim=1)
+        updated_eta = (
+            self.direction_eta[None, :, :]
+            + self.heading_kappa * unit[:, None, :]
+        )
+        circular = (
+            _log_i0(torch.linalg.vector_norm(updated_eta, dim=2))
+            - _log_i0(self.direction_r)[None, :]
+            - LOG_2PI
+            - _log_i0(self.heading_kappa)
+        )
+        component_log_density = euclidean + circular
+        log_weights = torch.log(
+            self.expected_weights().clamp_min(torch.finfo(DTYPE).tiny)
+        )
+        return torch.logsumexp(
+            log_weights[None, :] + component_log_density,
+            dim=1,
+        )
+
     def partial_fit(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
         if not self.initialized:
             self.initialize(x, theta)
@@ -450,6 +493,7 @@ class CollapsedDPSMC:
         initial_log_weight = -math.log(particles)
         self.particles = [_Particle(log_weight=initial_log_weight) for _ in range(particles)]
         self.ess_history: list[float] = []
+        self.log_score_history: list[float] = []
 
     def _posterior(self, stats: _ClusterStats) -> tuple[torch.Tensor, ...]:
         kappa = self.kappa0 + stats.n
@@ -542,6 +586,8 @@ class CollapsedDPSMC:
         for observation, angle in zip(x, theta):
             previous_n = len(self.particles[0].assignments)
             denominator = math.log(previous_n + self.alpha)
+            weights_before, _ = self._normalize()
+            increments: list[float] = []
             for particle in self.particles:
                 cluster_id, log_evidence = self._draw_assignment(
                     particle, observation, angle
@@ -550,7 +596,15 @@ class CollapsedDPSMC:
                 particle.assignments.append(cluster_id)
                 particle.x_history.append(observation.clone())
                 particle.theta_history.append(angle.clone())
-                particle.log_weight += float(log_evidence.item()) - denominator
+                increment = float(log_evidence.item()) - denominator
+                increments.append(increment)
+                particle.log_weight += increment
+            log_predictive = torch.logsumexp(
+                torch.log(weights_before.clamp_min(torch.finfo(DTYPE).tiny))
+                + torch.as_tensor(increments, dtype=DTYPE, device=DEVICE),
+                dim=0,
+            )
+            self.log_score_history.append(float(log_predictive.item()))
             weights, ess = self._normalize()
             if ess < self.resample_threshold:
                 self._systematic_resample(weights)

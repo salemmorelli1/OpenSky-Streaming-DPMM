@@ -41,8 +41,10 @@ jobs:
 
           status = json.loads(Path("data/project_status.json").read_text())
           assert status["empirical_results_available"] is False
+          assert status["authenticated_live_api_verified"] is True
           html = Path("index.html").read_text(encoding="utf-8")
           assert "No operational SIGINT claim" in html
-          assert "Empirical benchmark pending" in html
+          assert "Execution pipeline ready" in html
+          assert "No public empirical summary before 600 unique successful rows" in html
           assert len(PdfReader("report/OpenSky_Streaming_DPMM_APA_Report.pdf").pages) == 26
           PY

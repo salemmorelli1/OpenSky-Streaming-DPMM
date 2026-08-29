@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opensky-streaming-dpmm"
-version = "1.0.0"
+version = "1.1.0"
 description = "Topology-aware streaming Bayesian nonparametric clustering of OpenSky aircraft kinematics"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,8 @@ test = ["pytest>=8,<9"]
 
 [project.scripts]
 opensky-dpmm = "opensky_streaming_dpmm.engine:main"
+opensky-collect = "opensky_streaming_dpmm.collector:main"
+opensky-experiment = "opensky_streaming_dpmm.empirical:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

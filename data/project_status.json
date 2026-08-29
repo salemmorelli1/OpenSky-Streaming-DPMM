@@ -1,7 +1,7 @@
 {
   "project": "OpenSky Streaming DPMM",
-  "version": "1.0.0",
-  "status": "methodology_complete_empirical_benchmark_pending",
+  "version": "1.1.0",
+  "status": "execution_pipeline_ready_formal_benchmark_pending",
   "data_source": "OpenSky Network state vectors",
   "observation_space": "R^2 x S^1",
   "methods": [
@@ -11,6 +11,10 @@
   "factorial_cells": 6,
   "planned_blocks": 100,
   "planned_executions": 600,
+  "completed_blocks": 0,
+  "completed_executions": 0,
+  "authenticated_live_api_verified": true,
+  "authenticated_check_scope": "Operator-observed connectivity smoke test only; not a formal experimental block or performance result.",
   "dropout_rates": [0.0, 0.15, 0.3],
   "empirical_results_available": false,
   "claim_boundary": "No radar-pulse, emitter-identification, ELINT, SIGINT, or operational performance claim."

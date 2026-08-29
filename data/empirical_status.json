@@ -1,0 +1,16 @@
+{
+  "schema": "opensky-empirical-status-v1",
+  "release": "1.1.0",
+  "authenticated_connectivity": "verified_by_local_operator",
+  "connectivity_check_date": "2026-08-29",
+  "connectivity_check_is_performance_evidence": false,
+  "calibration_blocks_required": 10,
+  "calibration_blocks_complete": 0,
+  "analysis_lock_complete": false,
+  "formal_blocks_required": 100,
+  "formal_blocks_complete": 0,
+  "factorial_executions_required": 600,
+  "factorial_executions_complete": 0,
+  "public_empirical_summary_available": false,
+  "next_gate": "collect 10 separately scheduled calibration blocks with the credential-free collector"
+}

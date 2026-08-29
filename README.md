@@ -9,10 +9,12 @@ aircraft kinematics from the OpenSky Network. The project compares a truncated
 streaming variational Dirichlet-process mixture with a collapsed DP sequential
 Monte Carlo method under controlled observation thinning.
 
-**Release status:** the mathematical framework, implementation, tests,
-interactive laboratory, and experimental protocol are complete. The 600-run
-frozen OpenSky benchmark is preregistered but has not been executed; the site and
-report therefore contain no fabricated performance result.
+**Release 1.1 status:** authenticated live-API connectivity has been verified on
+the local research machine, and the repository now contains the complete
+restartable acquisition, calibration, six-cell replay, and aggregate-analysis
+pipeline. The 100-block/600-execution formal benchmark remains pending; no
+comparative performance result is fabricated or inferred from the connectivity
+smoke test.
 
 ## Research question
 
@@ -73,7 +75,7 @@ python -m opensky_streaming_dpmm.engine
 python -m pytest
 ```
 
-Run one descriptive live snapshot using the anonymous OpenSky tier:
+Run one descriptive live snapshot:
 
 ```bash
 python -m opensky_streaming_dpmm.engine --live
@@ -90,13 +92,56 @@ python scripts/build_site.py
 python scripts/build_report.py
 ```
 
+## Execute the empirical benchmark
+
+Raw blocks and credentials remain local. The collector discards callsign,
+origin-country, squawk, and raw ICAO24 before serialization; the retained track
+key is a keyed HMAC using a local, Git-ignored salt. Every compressed block has a
+content checksum and hashes of the original API responses.
+
+After loading `.env.local`, collect the ten calibration blocks:
+
+```bash
+python -m opensky_streaming_dpmm.collector \
+  --phase calibration --blocks 10 \
+  --snapshots-per-block 6 --interval-seconds 5 \
+  --spacing-seconds 900 --minimum-eligible-states 32
+
+unset OPENSKY_CLIENT_ID OPENSKY_CLIENT_SECRET
+python -m opensky_streaming_dpmm.empirical calibrate
+```
+
+Then collect 100 separately scheduled formal blocks, execute the paired design,
+and unlock the aggregate analysis:
+
+```bash
+source .env.local
+python -m opensky_streaming_dpmm.collector \
+  --phase formal --blocks 100 \
+  --snapshots-per-block 6 --interval-seconds 5 \
+  --spacing-seconds 900 --minimum-eligible-states 32
+
+unset OPENSKY_CLIENT_ID OPENSKY_CLIENT_SECRET
+python -m opensky_streaming_dpmm.empirical run
+python -m opensky_streaming_dpmm.empirical analyze
+python scripts/build_site.py
+```
+
+For publication-quality temporal coverage, collect the formal set as ten
+10-block sessions across multiple days rather than one uninterrupted session.
+See the [empirical execution guide](docs/EMPIRICAL_EXECUTION_GUIDE.md) for exact
+restart and start-index commands.
+
 ## Repository map
 
 ```text
-src/opensky_streaming_dpmm/engine.py   Core ingestion and inference algorithms
-tests/test_engine.py                   Numerical and structural invariants
+src/opensky_streaming_dpmm/engine.py      Core inference algorithms
+src/opensky_streaming_dpmm/collector.py   Restartable privacy-minimized acquisition
+src/opensky_streaming_dpmm/empirical.py   Calibration, 600-cell replay, analysis gate
+tests/                                  Numerical, privacy, and completeness invariants
 docs/STATISTICAL_MODEL.md              Full mathematical reconstruction
 docs/EXPERIMENT_PROTOCOL.md            Frozen 2 x 3 analysis plan
+docs/EMPIRICAL_EXECUTION_GUIDE.md       Exact local execution sequence
 docs/CLAIM_BOUNDARY.md                 Supported and unsupported conclusions
 scripts/build_site.py                  Reproducible interactive GitHub Pages site
 scripts/build_report.py                Reproducible 26-page APA-style report
@@ -126,6 +171,7 @@ may be committed after the frozen benchmark is executed.
 - [Statistical model](docs/STATISTICAL_MODEL.md)
 - [Experimental protocol](docs/EXPERIMENT_PROTOCOL.md)
 - [Claim boundary](docs/CLAIM_BOUNDARY.md)
+- [Empirical execution guide](docs/EMPIRICAL_EXECUTION_GUIDE.md)
 
 ## References
 
