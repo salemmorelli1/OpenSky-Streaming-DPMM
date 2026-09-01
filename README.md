@@ -9,12 +9,13 @@ aircraft kinematics from the OpenSky Network. The project compares a truncated
 streaming variational Dirichlet-process mixture with a collapsed DP sequential
 Monte Carlo method under controlled observation thinning.
 
-**Release 1.1 status:** authenticated live-API connectivity has been verified on
-the local research machine, and the repository now contains the complete
-restartable acquisition, calibration, six-cell replay, and aggregate-analysis
-pipeline. The 100-block/600-execution formal benchmark remains pending; no
-comparative performance result is fabricated or inferred from the connectivity
-smoke test.
+**Release 1.2 status:** authenticated live-API connectivity has been verified on
+the local research machine. Release 1.2 adds a prespecified, bounded acquisition
+retry policy with a non-identifying JSONL audit trail. It does not expand the
+geographic box or retry without limit. The first 13 formal blocks collected under
+release 1.1 are retained as pilot material and excluded from the amended formal
+benchmark. The 100-block/600-execution benchmark remains pending; no comparative
+performance result is fabricated.
 
 ## Research question
 
@@ -99,16 +100,22 @@ origin-country, squawk, and raw ICAO24 before serialization; the retained track
 key is a keyed HMAC using a local, Git-ignored salt. Every compressed block has a
 content checksum and hashes of the original API responses.
 
-After loading `.env.local`, collect the ten calibration blocks:
+After loading `.env.local`, collect a new ten-block calibration sample under the
+amended acquisition rule:
 
 ```bash
 python -m opensky_streaming_dpmm.collector \
+  --output data/recorded_blocks/amended \
   --phase calibration --blocks 10 \
   --snapshots-per-block 6 --interval-seconds 5 \
-  --spacing-seconds 900 --minimum-eligible-states 32
+  --spacing-seconds 900 --minimum-eligible-states 32 \
+  --max-attempts-per-block 4 --retry-delay-seconds 900 \
+  --attempt-log data/results/amended/collection_attempts.jsonl
 
 unset OPENSKY_CLIENT_ID OPENSKY_CLIENT_SECRET
-python -m opensky_streaming_dpmm.empirical calibrate
+python -m opensky_streaming_dpmm.empirical calibrate \
+  --blocks data/recorded_blocks/amended \
+  --output data/results/amended/locked_config.json
 ```
 
 Then collect 100 separately scheduled formal blocks, execute the paired design,
@@ -117,13 +124,20 @@ and unlock the aggregate analysis:
 ```bash
 source .env.local
 python -m opensky_streaming_dpmm.collector \
+  --output data/recorded_blocks/amended \
   --phase formal --blocks 100 \
   --snapshots-per-block 6 --interval-seconds 5 \
-  --spacing-seconds 900 --minimum-eligible-states 32
+  --spacing-seconds 900 --minimum-eligible-states 32 \
+  --max-attempts-per-block 4 --retry-delay-seconds 900 \
+  --attempt-log data/results/amended/collection_attempts.jsonl
 
 unset OPENSKY_CLIENT_ID OPENSKY_CLIENT_SECRET
-python -m opensky_streaming_dpmm.empirical run
-python -m opensky_streaming_dpmm.empirical analyze
+python -m opensky_streaming_dpmm.empirical run \
+  --blocks data/recorded_blocks/amended \
+  --lock data/results/amended/locked_config.json \
+  --output data/results/amended/factorial_results.csv
+python -m opensky_streaming_dpmm.empirical analyze \
+  --results data/results/amended/factorial_results.csv
 python scripts/build_site.py
 ```
 
@@ -142,6 +156,7 @@ tests/                                  Numerical, privacy, and completeness inv
 docs/STATISTICAL_MODEL.md              Full mathematical reconstruction
 docs/EXPERIMENT_PROTOCOL.md            Frozen 2 x 3 analysis plan
 docs/EMPIRICAL_EXECUTION_GUIDE.md       Exact local execution sequence
+docs/PROTOCOL_AMENDMENT_2026-09-01.md   Bounded-retry amendment and pilot boundary
 docs/CLAIM_BOUNDARY.md                 Supported and unsupported conclusions
 scripts/build_site.py                  Reproducible interactive GitHub Pages site
 scripts/build_report.py                Reproducible 26-page APA-style report

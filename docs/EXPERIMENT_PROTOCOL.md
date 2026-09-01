@@ -69,6 +69,14 @@ minimum-completeness threshold are excluded before method execution and logged
 with a reason. Network latency is reported separately from synchronized model
 compute time.
 
+Release 1.2 prespecifies at most four complete-block attempts separated by 900
+seconds. Every rejected and accepted attempt is written to a local JSONL audit
+with its reason, eligible count, box, threshold, and timestamp. The collector
+stops after the fourth rejection. It never samples without a ceiling and never
+silently discards the attempt history. The 13 release-1.1 formal blocks collected
+before this rule was fixed are pilot material and do not enter the amended
+formal analysis. See `PROTOCOL_AMENDMENT_2026-09-01.md`.
+
 ## Execution lock
 
 Ten calibration blocks are excluded from all formal contrasts. They select the

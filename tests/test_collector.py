@@ -1,11 +1,14 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from opensky_streaming_dpmm.collector import (
     CollectionConfig,
+    CollectionError,
     atomic_write_gzip_json,
     canonical_json_bytes,
+    collect_blocks,
     read_verified_block,
     sanitize_payload,
     sha256_bytes,
@@ -30,6 +33,16 @@ def state_row(icao="abc123", speed=210.0, heading=359.0, vertical_rate=2.0):
     row[16] = 0
     row[17] = 3
     return row
+
+
+class SequenceClient:
+    def __init__(self, eligible_counts):
+        self.eligible_counts = iter(eligible_counts)
+
+    def get_states(self, bbox):
+        count = next(self.eligible_counts)
+        rows = [state_row(icao=f"{index:06x}") for index in range(count)]
+        return {"time": 123, "states": rows}, {"network_latency_ms": 1.0}
 
 
 class CollectorPrivacyTests(unittest.TestCase):
@@ -68,6 +81,70 @@ class CollectorPrivacyTests(unittest.TestCase):
     def test_collection_config_rejects_non_streaming_block(self):
         with self.assertRaises(ValueError):
             CollectionConfig("formal", (49, 7, 54, 13), 1, 5.0, 10)
+
+    def test_bounded_retry_logs_rejection_and_acceptance(self):
+        config = CollectionConfig(
+            "formal",
+            (49, 7, 54, 13),
+            2,
+            0.0,
+            2,
+            max_attempts_per_block=2,
+            retry_delay_seconds=3.0,
+        )
+        client = SequenceClient([1, 2, 2])
+        sleeps = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attempt_log = root / "attempts.jsonl"
+            paths = collect_blocks(
+                root / "blocks",
+                1,
+                config,
+                0.0,
+                client=client,
+                salt_path=root / "salt.bin",
+                attempt_log_path=attempt_log,
+                sleep_fn=sleeps.append,
+            )
+            block = read_verified_block(paths[0])
+            records = [json.loads(line) for line in attempt_log.read_text().splitlines()]
+
+        self.assertEqual(sleeps, [3.0])
+        self.assertEqual([record["outcome"] for record in records], ["rejected", "accepted"])
+        self.assertEqual(records[0]["eligible_states"], 1)
+        self.assertEqual(block["acceptance_policy"]["accepted_attempt"], 2)
+
+    def test_bounded_retry_stops_after_prespecified_limit(self):
+        config = CollectionConfig(
+            "formal",
+            (49, 7, 54, 13),
+            2,
+            0.0,
+            2,
+            max_attempts_per_block=2,
+        )
+        client = SequenceClient([1, 1])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attempt_log = root / "attempts.jsonl"
+            with self.assertRaisesRegex(CollectionError, "failed after 2 bounded attempts"):
+                collect_blocks(
+                    root / "blocks",
+                    1,
+                    config,
+                    0.0,
+                    client=client,
+                    salt_path=root / "salt.bin",
+                    attempt_log_path=attempt_log,
+                    sleep_fn=lambda _: None,
+                )
+            records = [json.loads(line) for line in attempt_log.read_text().splitlines()]
+
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(record["outcome"] == "rejected" for record in records))
 
 
 if __name__ == "__main__":

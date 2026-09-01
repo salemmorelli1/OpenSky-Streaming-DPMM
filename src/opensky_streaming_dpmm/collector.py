@@ -17,13 +17,13 @@ import os
 import secrets
 import tempfile
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import requests
-
 
 API_URL = "https://opensky-network.org/api/states/all"
 TOKEN_URL = (
@@ -38,6 +38,28 @@ class CollectionError(RuntimeError):
     """Raised when a block cannot be collected or verified."""
 
 
+class EligibilityError(CollectionError):
+    """Raised when a snapshot fails the prespecified completeness threshold."""
+
+    def __init__(
+        self,
+        block_id: str,
+        snapshot_index: int,
+        eligible_states: int,
+        minimum_eligible_states: int,
+        eligible_counts: list[int],
+    ) -> None:
+        super().__init__(
+            f"{block_id} snapshot {snapshot_index} has only "
+            f"{eligible_states} eligible states"
+        )
+        self.block_id = block_id
+        self.snapshot_index = snapshot_index
+        self.eligible_states = eligible_states
+        self.minimum_eligible_states = minimum_eligible_states
+        self.eligible_counts = eligible_counts
+
+
 @dataclass(frozen=True)
 class CollectionConfig:
     phase: str
@@ -45,6 +67,8 @@ class CollectionConfig:
     snapshots_per_block: int
     interval_seconds: float
     minimum_eligible_states: int
+    max_attempts_per_block: int = 1
+    retry_delay_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if self.phase not in {"calibration", "formal"}:
@@ -56,6 +80,8 @@ class CollectionConfig:
             raise ValueError("a streaming block requires at least two snapshots")
         if self.interval_seconds < 0 or self.minimum_eligible_states < 1:
             raise ValueError("invalid timing or eligibility threshold")
+        if self.max_attempts_per_block < 1 or self.retry_delay_seconds < 0:
+            raise ValueError("invalid bounded-retry policy")
 
 
 class OAuthSession:
@@ -228,11 +254,10 @@ def atomic_write_gzip_json(path: Path, value: dict[str, Any]) -> str:
     descriptor, temporary = tempfile.mkstemp(prefix=path.name, dir=path.parent)
     os.close(descriptor)
     try:
-        with Path(temporary).open("wb") as raw_stream:
-            with gzip.GzipFile(
-                filename="", mode="wb", fileobj=raw_stream, mtime=0
-            ) as stream:
-                stream.write(canonical)
+        with Path(temporary).open("wb") as raw_stream, gzip.GzipFile(
+            filename="", mode="wb", fileobj=raw_stream, mtime=0
+        ) as stream:
+            stream.write(canonical)
         os.replace(temporary, path)
     except Exception:
         Path(temporary).unlink(missing_ok=True)
@@ -256,11 +281,23 @@ def read_verified_block(path: Path) -> dict[str, Any]:
     return value
 
 
+def append_attempt_record(path: Path, record: dict[str, Any]) -> None:
+    """Append one non-identifying acquisition-attempt record to a JSONL audit."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(line)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 def build_block(
     client: OAuthSession,
     config: CollectionConfig,
     salt: bytes,
     block_id: str,
+    attempt_number: int = 1,
 ) -> dict[str, Any]:
     snapshots: list[dict[str, Any]] = []
     raw_hashes: list[str] = []
@@ -269,9 +306,17 @@ def build_block(
         raw_hashes.append(sha256_bytes(canonical_json_bytes(raw)))
         sanitized = sanitize_payload(raw, salt)
         if sanitized["eligible_observations"] < config.minimum_eligible_states:
-            raise CollectionError(
-                f"{block_id} snapshot {index} has only "
-                f"{sanitized['eligible_observations']} eligible states"
+            eligible = int(sanitized["eligible_observations"])
+            raise EligibilityError(
+                block_id,
+                index,
+                eligible,
+                config.minimum_eligible_states,
+                [
+                    int(snapshot["eligible_observations"])
+                    for snapshot in snapshots
+                ]
+                + [eligible],
             )
         sanitized["snapshot_index"] = index
         sanitized["transport"] = transport
@@ -288,6 +333,12 @@ def build_block(
         "bbox": list(config.bbox),
         "snapshots_per_block": config.snapshots_per_block,
         "interval_seconds": config.interval_seconds,
+        "acceptance_policy": {
+            "minimum_eligible_states": config.minimum_eligible_states,
+            "max_attempts_per_block": config.max_attempts_per_block,
+            "retry_delay_seconds": config.retry_delay_seconds,
+            "accepted_attempt": attempt_number,
+        },
         "identity_policy": (
             "ICAO24 transformed by a local keyed HMAC; callsign, origin country, "
             "squawk, and raw ICAO24 are discarded before serialization."
@@ -315,6 +366,8 @@ def collect_blocks(
     start_index: int = 1,
     client: OAuthSession | None = None,
     salt_path: Path | None = None,
+    attempt_log_path: Path | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
 ) -> list[Path]:
     """Collect missing block indices and verify every completed artifact."""
 
@@ -336,12 +389,68 @@ def collect_blocks(
             read_verified_block(destination)
             completed.append(destination)
             continue
-        block = build_block(client, config, salt, block_id)
+
+        block: dict[str, Any] | None = None
+        for attempt in range(1, config.max_attempts_per_block + 1):
+            attempted_at = datetime.now(timezone.utc).isoformat()
+            try:
+                block = build_block(client, config, salt, block_id, attempt)
+            except (CollectionError, requests.RequestException) as error:
+                record: dict[str, Any] = {
+                    "schema": "opensky-collection-attempt-v1",
+                    "attempted_at_utc": attempted_at,
+                    "block_id": block_id,
+                    "attempt": attempt,
+                    "maximum_attempts": config.max_attempts_per_block,
+                    "outcome": "rejected",
+                    "error_type": type(error).__name__,
+                    "reason": str(error),
+                    "bbox": list(config.bbox),
+                    "minimum_eligible_states": config.minimum_eligible_states,
+                }
+                if isinstance(error, EligibilityError):
+                    record.update(
+                        {
+                            "failed_snapshot_index": error.snapshot_index,
+                            "eligible_states": error.eligible_states,
+                            "eligible_counts_before_rejection": error.eligible_counts,
+                        }
+                    )
+                if attempt_log_path is not None:
+                    append_attempt_record(attempt_log_path, record)
+                if attempt == config.max_attempts_per_block:
+                    raise CollectionError(
+                        f"{block_id} failed after {attempt} bounded attempts: {error}"
+                    ) from error
+                if config.retry_delay_seconds:
+                    sleep_fn(config.retry_delay_seconds)
+
+        if block is None:  # Defensive invariant; the retry loop returns or raises.
+            raise AssertionError("bounded retry loop ended without a block")
         atomic_write_gzip_json(destination, block)
         read_verified_block(destination)
+        if attempt_log_path is not None:
+            append_attempt_record(
+                attempt_log_path,
+                {
+                    "schema": "opensky-collection-attempt-v1",
+                    "attempted_at_utc": attempted_at,
+                    "block_id": block_id,
+                    "attempt": block["acceptance_policy"]["accepted_attempt"],
+                    "maximum_attempts": config.max_attempts_per_block,
+                    "outcome": "accepted",
+                    "bbox": list(config.bbox),
+                    "minimum_eligible_states": config.minimum_eligible_states,
+                    "eligible_counts": [
+                        snapshot["eligible_observations"]
+                        for snapshot in block["snapshots"]
+                    ],
+                    "content_sha256": block["integrity"]["content_sha256"],
+                },
+            )
         completed.append(destination)
         if offset + 1 < count and spacing_seconds:
-            time.sleep(spacing_seconds)
+            sleep_fn(spacing_seconds)
     return completed
 
 
@@ -363,6 +472,13 @@ def main() -> None:
     parser.add_argument("--interval-seconds", type=float, default=5.0)
     parser.add_argument("--spacing-seconds", type=float, default=60.0)
     parser.add_argument("--minimum-eligible-states", type=int, default=32)
+    parser.add_argument("--max-attempts-per-block", type=int, default=1)
+    parser.add_argument("--retry-delay-seconds", type=float, default=0.0)
+    parser.add_argument(
+        "--attempt-log",
+        type=Path,
+        default=Path("data/results/collection_attempts.jsonl"),
+    )
     parser.add_argument(
         "--bbox",
         nargs=4,
@@ -377,6 +493,8 @@ def main() -> None:
         snapshots_per_block=args.snapshots_per_block,
         interval_seconds=args.interval_seconds,
         minimum_eligible_states=args.minimum_eligible_states,
+        max_attempts_per_block=args.max_attempts_per_block,
+        retry_delay_seconds=args.retry_delay_seconds,
     )
     paths = collect_blocks(
         args.output,
@@ -384,6 +502,7 @@ def main() -> None:
         config,
         args.spacing_seconds,
         args.start_index,
+        attempt_log_path=args.attempt_log,
     )
     print(json.dumps({"completed": len(paths), "last": str(paths[-1])}, indent=2))
 
