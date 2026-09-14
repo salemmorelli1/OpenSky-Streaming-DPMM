@@ -25,13 +25,17 @@ jobs:
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e ".[test,report]"
       - name: Test mathematical and API invariants
-        run: python -m pytest
+        run: |
+          python -m py_compile src/opensky_streaming_dpmm/*.py scripts/*.py tests/*.py
+          python -m ruff check src scripts tests --select F,E9,B023
+          python -m pytest
       - name: Run deterministic smoke benchmark
         run: python -m opensky_streaming_dpmm.engine
       - name: Rebuild publication artifacts
         run: |
           python scripts/build_site.py
           python scripts/build_report.py
+          git diff --exit-code -- index.html
       - name: Audit artifact boundaries
         run: |
           python - <<'PY'
@@ -46,5 +50,8 @@ jobs:
           assert "No operational SIGINT claim" in html
           assert "Execution pipeline ready" in html
           assert "No public empirical summary before 600 unique successful rows" in html
-          assert len(PdfReader("report/OpenSky_Streaming_DPMM_APA_Report.pdf").pages) == 26
+          pdf = PdfReader("report/OpenSky_Streaming_DPMM_APA_Report.pdf")
+          assert len(pdf.pages) == 26
+          pdf_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+          assert "Paired Block-Contrast Model" in pdf_text
           PY

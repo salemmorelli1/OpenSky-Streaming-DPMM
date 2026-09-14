@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import hmac
 import json
 import math
 import os
 import platform
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -32,6 +33,11 @@ from .engine import (
 METHODS = ("streaming_vi", "collapsed_dp_smc")
 DROPOUT_LEVELS = (0.0, 0.15, 0.30)
 LOCK_SCHEMA = "opensky-frozen-analysis-v1"
+PRIMARY_ENDPOINTS = (
+    "mean_prequential_log_score",
+    "compute_latency_ms_per_observation",
+    "occupied_clusters",
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +58,32 @@ class BlockData:
 def _stable_seed(*parts: object) -> int:
     value = "|".join(map(str, parts)).encode("utf-8")
     return int.from_bytes(hashlib.sha256(value).digest()[:8], "big") % (2**32)
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_locked_config(path: Path) -> dict[str, Any]:
+    """Load a lock only when its embedded fingerprint matches its contents."""
+
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if config.get("schema") != LOCK_SCHEMA or config.get("status") != "locked":
+        raise ValueError("invalid or unlocked analysis configuration")
+    expected = config.get("lock_sha256")
+    fingerprint_input = dict(config)
+    fingerprint_input.pop("lock_sha256", None)
+    actual = _canonical_sha256(fingerprint_input)
+    if not isinstance(expected, str) or not hmac.compare_digest(expected, actual):
+        raise ValueError("analysis lock fingerprint mismatch")
+    if tuple(config.get("dropout_levels", ())) != DROPOUT_LEVELS:
+        raise ValueError("analysis lock does not match the implemented factorial design")
+    if tuple(config.get("primary_endpoints", ())) != PRIMARY_ENDPOINTS:
+        raise ValueError("analysis lock does not match the primary endpoints")
+    return config
 
 
 def load_block(path: Path) -> BlockData:
@@ -90,7 +122,9 @@ def normalized_mutual_information(labels: np.ndarray, categories: np.ndarray) ->
 
     labels = np.asarray(labels)
     categories = np.asarray(categories)
-    valid = categories >= 0
+    # OpenSky category 0 means "no information" and 1 means "no ADS-B
+    # category information"; neither is an external class label.
+    valid = categories >= 2
     labels, categories = labels[valid], categories[valid]
     if labels.size < 2:
         return float("nan")
@@ -143,12 +177,19 @@ def calibrate_truncation(
     saturation_threshold: float = 0.05,
     particles: int = 64,
     seed: int = 2026,
+    expected_blocks: int = 10,
 ) -> dict[str, Any]:
     """Select K using calibration blocks that are excluded from formal analysis."""
 
     blocks = [load_block(path) for path in sorted(block_paths)]
-    if not blocks or any(block.phase != "calibration" for block in blocks):
-        raise ValueError("calibration requires nonempty calibration-phase blocks")
+    if len(blocks) != expected_blocks:
+        raise ValueError(f"calibration requires exactly {expected_blocks} verified blocks")
+    if any(block.phase != "calibration" for block in blocks):
+        raise ValueError("calibration requires calibration-phase blocks")
+    if len({block.block_id for block in blocks}) != expected_blocks:
+        raise ValueError("duplicate calibration block identifiers")
+    if len({block.content_sha256 for block in blocks}) != expected_blocks:
+        raise ValueError("duplicate calibration block contents")
     diagnostics: list[dict[str, Any]] = []
     selected: int | None = None
     for k in candidate_k:
@@ -156,7 +197,8 @@ def calibrate_truncation(
         saturation: list[float] = []
         usable = True
         for block in blocks:
-            if min(snapshot.x.shape[0] for snapshot in block.snapshots) < k:
+            thinned = thinned_snapshots(block, max(DROPOUT_LEVELS), seed)
+            if min(snapshot.x.shape[0] for snapshot in thinned) < k:
                 usable = False
                 break
             model = StreamingCircularDPMM(
@@ -202,17 +244,10 @@ def calibrate_truncation(
         "rejuvenation_window": 24,
         "dropout_levels": list(DROPOUT_LEVELS),
         "base_seed": seed,
-        "primary_endpoints": [
-            "mean_prequential_log_score",
-            "compute_latency_ms_per_observation",
-            "occupied_clusters",
-        ],
+        "primary_endpoints": list(PRIMARY_ENDPOINTS),
         "secondary_endpoint": "category_nmi_evaluation_only",
     }
-    fingerprint_input = dict(locked)
-    locked["lock_sha256"] = hashlib.sha256(
-        json.dumps(fingerprint_input, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    locked["lock_sha256"] = _canonical_sha256(locked)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(locked, indent=2) + "\n", encoding="utf-8")
     return locked
@@ -229,9 +264,11 @@ def _fit_vi(
     labels: list[np.ndarray] = []
     categories: list[np.ndarray] = []
     scores: list[np.ndarray] = []
+    if not snapshots or snapshots[0].x.shape[0] < model.K:
+        raise ValueError("initial retained snapshot has fewer observations than locked K")
     for index, snapshot in enumerate(snapshots):
-        if snapshot.x.shape[0] < model.K:
-            raise ValueError("retained snapshot has fewer observations than locked K")
+        if snapshot.x.shape[0] < 1:
+            raise ValueError("retained snapshot is empty")
         if index > 0:
             scores.append(model.log_predictive(snapshot.x, snapshot.theta).detach().cpu().numpy())
         responsibility = model.partial_fit(snapshot.x, snapshot.theta)
@@ -332,23 +369,41 @@ def run_factorial(
     output: Path,
     expected_blocks: int = 100,
 ) -> list[dict[str, Any]]:
-    config = json.loads(lock_path.read_text(encoding="utf-8"))
-    if config.get("schema") != LOCK_SCHEMA or config.get("status") != "locked":
-        raise ValueError("invalid or unlocked analysis configuration")
+    config = load_locked_config(lock_path)
     blocks = [load_block(path) for path in sorted(block_paths)]
     if len(blocks) != expected_blocks:
         raise ValueError(f"formal run requires exactly {expected_blocks} verified blocks")
     if len({block.block_id for block in blocks}) != expected_blocks:
         raise ValueError("duplicate formal block identifiers")
+    if len({block.content_sha256 for block in blocks}) != expected_blocks:
+        raise ValueError("duplicate formal block contents")
+    if any(block.phase != "formal" for block in blocks):
+        raise ValueError("formal execution requires formal-phase blocks")
     calibration_ids = set(config["calibration_block_ids"])
     if calibration_ids.intersection(block.block_id for block in blocks):
         raise ValueError("calibration/formal block leakage detected")
 
+    block_lookup = {block.block_id: block for block in blocks}
+    expected_keys = {
+        (block.block_id, method, dropout)
+        for block in blocks
+        for method in METHODS
+        for dropout in DROPOUT_LEVELS
+    }
     existing: dict[tuple[str, str, float], dict[str, Any]] = {}
     if output.exists():
         with output.open(newline="", encoding="utf-8") as stream:
             for row in csv.DictReader(stream):
-                key = (row["block_id"], row["method"], float(row["dropout_rate"]))
+                key = _result_key(row)
+                if key not in expected_keys:
+                    raise ValueError(f"checkpoint contains out-of-design cell: {key}")
+                if key in existing:
+                    raise ValueError(f"checkpoint contains duplicate cell: {key}")
+                _validate_result_row(
+                    row,
+                    expected_lock=str(config["lock_sha256"]),
+                    expected_block_sha=block_lookup[key[0]].content_sha256,
+                )
                 existing[key] = row
     _warm_up()
     records: list[dict[str, Any]] = list(existing.values())
@@ -365,10 +420,42 @@ def run_factorial(
                     )
                 continue
             record = execute_cell(block, method, dropout, config)
+            record["lock_sha256"] = config["lock_sha256"]
             records.append(record)
             _write_results(output, records)
     _write_results(output, records)
     return records
+
+
+def _result_key(row: dict[str, Any]) -> tuple[str, str, float]:
+    try:
+        return str(row["block_id"]), str(row["method"]), float(row["dropout_rate"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("result row has an invalid factorial key") from error
+
+
+def _is_success(value: Any) -> bool:
+    return str(value).lower() in {"true", "1"}
+
+
+def _validate_result_row(
+    row: dict[str, Any], expected_lock: str, expected_block_sha: str | None = None
+) -> None:
+    if row.get("lock_sha256") != expected_lock:
+        raise ValueError("result row was not produced under the verified analysis lock")
+    if expected_block_sha is not None and row.get("block_sha256") != expected_block_sha:
+        raise ValueError(f"stale checkpoint for {row.get('block_id')}: block hash changed")
+    if not _is_success(row.get("success")):
+        raise ValueError("result row is not a successful completed cell")
+    for endpoint in PRIMARY_ENDPOINTS:
+        try:
+            value = float(row[endpoint])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"result row has invalid primary endpoint: {endpoint}") from error
+        if not math.isfinite(value):
+            raise ValueError(f"result row has non-finite primary endpoint: {endpoint}")
+        if endpoint != "mean_prequential_log_score" and value <= 0:
+            raise ValueError(f"result row has non-positive primary endpoint: {endpoint}")
 
 
 def _write_results(path: Path, records: list[dict[str, Any]]) -> None:
@@ -388,35 +475,90 @@ def _mean_ci(values: np.ndarray) -> dict[str, float | int]:
     values = values[np.isfinite(values)]
     n = values.size
     if n < 2:
-        return {"n": int(n), "estimate": float("nan"), "lower_95": float("nan"), "upper_95": float("nan")}
+        return {
+            "n": int(n),
+            "estimate": float("nan"),
+            "lower_95": float("nan"),
+            "upper_95": float("nan"),
+            "p_value_two_sided": float("nan"),
+        }
     mean = float(np.mean(values))
     se = float(np.std(values, ddof=1) / math.sqrt(n))
     critical = float(student_t.ppf(0.975, n - 1))
-    return {"n": int(n), "estimate": mean, "lower_95": mean - critical * se, "upper_95": mean + critical * se}
+    if se == 0:
+        p_value = 1.0 if mean == 0 else 0.0
+    else:
+        p_value = float(2.0 * student_t.sf(abs(mean / se), n - 1))
+    return {
+        "n": int(n),
+        "estimate": mean,
+        "lower_95": mean - critical * se,
+        "upper_95": mean + critical * se,
+        "p_value_two_sided": p_value,
+    }
+
+
+def _add_holm_adjustment(contrasts: Iterable[dict[str, Any]]) -> None:
+    valid = [item for item in contrasts if math.isfinite(item["p_value_two_sided"])]
+    ordered = sorted(valid, key=lambda item: item["p_value_two_sided"])
+    running = 0.0
+    total = len(ordered)
+    for rank, item in enumerate(ordered):
+        adjusted = min(1.0, (total - rank) * item["p_value_two_sided"])
+        running = max(running, adjusted)
+        item["p_value_holm"] = running
+    for item in contrasts:
+        item.setdefault("p_value_holm", float("nan"))
 
 
 def analyze_results(
     results_path: Path,
+    lock_path: Path,
     public_summary: Path,
     project_status_path: Path,
     expected_blocks: int = 100,
 ) -> dict[str, Any]:
+    config = load_locked_config(lock_path)
     with results_path.open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
     expected_rows = expected_blocks * len(METHODS) * len(DROPOUT_LEVELS)
-    keys = {(row["block_id"], row["method"], float(row["dropout_rate"])) for row in rows}
+    keys = {_result_key(row) for row in rows}
     if len(rows) != expected_rows or len(keys) != expected_rows:
         raise ValueError(f"analysis is locked until all {expected_rows} unique cells exist")
-    if any(str(row.get("success", "")).lower() not in {"true", "1"} for row in rows):
-        raise ValueError("analysis is locked because at least one cell is unsuccessful")
 
     block_ids = sorted({row["block_id"] for row in rows})
     if len(block_ids) != expected_blocks:
         raise ValueError(f"analysis requires exactly {expected_blocks} distinct blocks")
+    expected_keys = {
+        (block_id, method, dropout)
+        for block_id in block_ids
+        for method in METHODS
+        for dropout in DROPOUT_LEVELS
+    }
+    if keys != expected_keys:
+        raise ValueError("analysis contains cells outside the locked 2 x 3 design")
+    if set(config["calibration_block_ids"]).intersection(block_ids):
+        raise ValueError("calibration/formal block leakage detected during analysis")
+
+    block_hashes: dict[str, str] = {}
+    for row in rows:
+        _validate_result_row(row, expected_lock=str(config["lock_sha256"]))
+        block_hash = row.get("block_sha256")
+        if (
+            not isinstance(block_hash, str)
+            or len(block_hash) != 64
+            or any(character not in "0123456789abcdef" for character in block_hash)
+        ):
+            raise ValueError("result row has an invalid block fingerprint")
+        prior = block_hashes.setdefault(row["block_id"], block_hash)
+        if prior != block_hash:
+            raise ValueError(f"result rows mix block contents for {row['block_id']}")
+
     lookup = {(row["block_id"], row["method"], float(row["dropout_rate"])): row for row in rows}
     endpoint_specs = {
         "mean_prequential_log_score": False,
         "log_compute_latency_ms_per_observation": True,
+        "occupied_clusters": False,
         "category_nmi_evaluation_only": False,
     }
     analyses: dict[str, Any] = {}
@@ -427,24 +569,33 @@ def analyze_results(
                 for d, dropout in enumerate(DROPOUT_LEVELS):
                     source = "compute_latency_ms_per_observation" if log_transform else endpoint
                     value = float(lookup[(block_id, method, dropout)][source])
+                    if endpoint == "category_nmi_evaluation_only":
+                        if math.isinf(value) or (math.isfinite(value) and not 0 <= value <= 1):
+                            raise ValueError("category NMI must be in [0, 1] or missing")
                     cube[b, m, d] = math.log(value) if log_transform else value
         method_difference = cube[:, 1, :] - cube[:, 0, :]
         marginal = cube.mean(axis=1)
+        paired = {
+            str(dropout): _mean_ci(method_difference[:, index])
+            for index, dropout in enumerate(DROPOUT_LEVELS)
+        }
+        orthogonal = {
+            "architecture_average": _mean_ci(method_difference.mean(axis=1)),
+            "dropout_linear": _mean_ci(marginal @ np.asarray([-1.0, 0.0, 1.0])),
+            "dropout_quadratic": _mean_ci(marginal @ np.asarray([1.0, -2.0, 1.0])),
+            "architecture_x_linear": _mean_ci(method_difference @ np.asarray([-1.0, 0.0, 1.0])),
+            "architecture_x_quadratic": _mean_ci(method_difference @ np.asarray([1.0, -2.0, 1.0])),
+        }
+        _add_holm_adjustment([*paired.values(), *orthogonal.values()])
         analyses[endpoint] = {
             "direction": "SMC minus VI" if not log_transform else "log(SMC latency) minus log(VI latency)",
-            "paired_architecture_by_dropout": {
-                str(dropout): _mean_ci(method_difference[:, index])
-                for index, dropout in enumerate(DROPOUT_LEVELS)
-            },
-            "orthogonal_block_contrasts": {
-                "architecture_average": _mean_ci(method_difference.mean(axis=1)),
-                "dropout_linear": _mean_ci(marginal @ np.asarray([-1.0, 0.0, 1.0])),
-                "dropout_quadratic": _mean_ci(marginal @ np.asarray([1.0, -2.0, 1.0])),
-                "architecture_x_linear": _mean_ci(method_difference @ np.asarray([-1.0, 0.0, 1.0])),
-                "architecture_x_quadratic": _mean_ci(method_difference @ np.asarray([1.0, -2.0, 1.0])),
-            },
+            "multiplicity": "Holm adjustment across the eight prespecified contrasts for this endpoint",
+            "paired_architecture_by_dropout": paired,
+            "orthogonal_block_contrasts": orthogonal,
         }
 
+    results_sha256 = hashlib.sha256(results_path.read_bytes()).hexdigest()
+    block_manifest_sha256 = _canonical_sha256(sorted(block_hashes.items()))
     summary = {
         "project": "OpenSky Streaming DPMM",
         "status": "complete_empirical_benchmark",
@@ -454,6 +605,11 @@ def analyze_results(
         "methods": list(METHODS),
         "dropout_levels": list(DROPOUT_LEVELS),
         "analysis": analyses,
+        "provenance": {
+            "analysis_lock_sha256": config["lock_sha256"],
+            "factorial_results_sha256": results_sha256,
+            "formal_block_manifest_sha256": block_manifest_sha256,
+        },
         "hardware": {
             "platform": platform.platform(),
             "python": sys.version.split()[0],
@@ -496,6 +652,7 @@ def main() -> None:
 
     analyze = subparsers.add_parser("analyze")
     analyze.add_argument("--results", type=Path, default=Path("data/results/factorial_results.csv"))
+    analyze.add_argument("--lock", type=Path, default=Path("data/results/locked_config.json"))
     analyze.add_argument("--public-summary", type=Path, default=Path("data/empirical_summary.json"))
     analyze.add_argument("--status", type=Path, default=Path("data/project_status.json"))
     args = parser.parse_args()
@@ -505,7 +662,7 @@ def main() -> None:
     elif args.command == "run":
         result = {"executions": len(run_factorial(args.blocks.glob("formal-*.json.gz"), args.lock, args.output))}
     else:
-        result = analyze_results(args.results, args.public_summary, args.status)
+        result = analyze_results(args.results, args.lock, args.public_summary, args.status)
     print(json.dumps(result, indent=2))
 
 

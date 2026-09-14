@@ -1,7 +1,7 @@
 {
   "project": "OpenSky Streaming DPMM",
-  "version": "1.1.0",
-  "status": "execution_pipeline_ready_formal_benchmark_pending",
+  "version": "1.3.0",
+  "status": "integrity_hardening_ready_recalibration_pending",
   "data_source": "OpenSky Network state vectors",
   "observation_space": "R^2 x S^1",
   "methods": [
@@ -13,6 +13,11 @@
   "planned_executions": 600,
   "completed_blocks": 0,
   "completed_executions": 0,
+  "pilot_formal_blocks_excluded": 13,
+  "maximum_attempts_per_block": 4,
+  "retry_delay_seconds": 900,
+  "minimum_eligible_states": 32,
+  "geographic_box_changed": false,
   "authenticated_live_api_verified": true,
   "authenticated_check_scope": "Operator-observed connectivity smoke test only; not a formal experimental block or performance result.",
   "dropout_rates": [0.0, 0.15, 0.3],

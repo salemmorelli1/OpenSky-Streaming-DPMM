@@ -2,10 +2,12 @@
 
 ## Scope
 
-Release 1.1 converts the validated methods prototype into a restartable empirical
-pipeline. The authenticated one-snapshot command already established API
-connectivity; it is not one of the formal experimental blocks. Formal evidence
-begins only with the acquisition sequence below.
+Release 1.2 adds the bounded-retry amendment documented in
+`PROTOCOL_AMENDMENT_2026-09-01.md`. The authenticated one-snapshot command and
+the 13 release-1.1 formal blocks are pilot evidence only. The amended formal
+experiment begins in the separate `data/recorded_blocks/amended` directory.
+Release 1.3 additionally verifies the analysis-lock fingerprint at replay and
+analysis time and binds every checkpoint row to that lock and its block hash.
 
 The raw pseudonymized blocks, local pseudonym key, locked configuration, and
 row-level results remain ignored by Git. Only the completed aggregate summary
@@ -21,6 +23,11 @@ network time is excluded from compute latency.
 
 The default WGS84 box is `(49, 7, 54, 13)`. Changing the box changes the target
 population and therefore requires a new calibration and analysis lock.
+
+Each amended block has at most four complete-block attempts separated by 900
+seconds. A failed snapshot rejects the entire attempt. All attempts are logged
+to `data/results/amended/collection_attempts.jsonl`; after four failures the
+collector stops. This is a bounded acceptance rule, not sampling until success.
 
 ## 1. Load local credentials
 
@@ -41,12 +48,16 @@ Collect ten calibration blocks at separately scheduled times:
 
 ```bash
 python -m opensky_streaming_dpmm.collector \
+  --output data/recorded_blocks/amended \
   --phase calibration \
   --blocks 10 \
   --snapshots-per-block 6 \
   --interval-seconds 5 \
   --spacing-seconds 900 \
-  --minimum-eligible-states 32
+  --minimum-eligible-states 32 \
+  --max-attempts-per-block 4 \
+  --retry-delay-seconds 900 \
+  --attempt-log data/results/amended/collection_attempts.jsonl
 ```
 
 The command is restartable. Existing blocks are checksum-verified and skipped.
@@ -58,7 +69,9 @@ using `--blocks` with the next `--start-index`.
 ```bash
 unset OPENSKY_CLIENT_ID
 unset OPENSKY_CLIENT_SECRET
-python -m opensky_streaming_dpmm.empirical calibrate
+python -m opensky_streaming_dpmm.empirical calibrate \
+  --blocks data/recorded_blocks/amended \
+  --output data/results/amended/locked_config.json
 ```
 
 Calibration evaluates `K = 8, 12, 16, 24, 32`. The smallest value is selected
@@ -66,8 +79,8 @@ only if the 95th percentile of the final residual-component weight is at most
 0.01 and the boundary-saturation rate is at most 0.05. Failure is a hard stop:
 expand the candidate grid, document the amendment, and recalibrate.
 
-The output `data/results/locked_config.json` contains the calibration block
-checksums, selected truncation, particle count, seeds, and primary endpoints.
+The output `data/results/amended/locked_config.json` contains the calibration
+block checksums, selected truncation, particle count, seeds, and endpoints.
 
 ## 4. Collect 100 formal blocks
 
@@ -77,13 +90,17 @@ blocks give better temporal coverage than one uninterrupted burst:
 ```bash
 source .env.local
 python -m opensky_streaming_dpmm.collector \
+  --output data/recorded_blocks/amended \
   --phase formal \
   --blocks 10 \
   --start-index 1 \
   --snapshots-per-block 6 \
   --interval-seconds 5 \
   --spacing-seconds 900 \
-  --minimum-eligible-states 32
+  --minimum-eligible-states 32 \
+  --max-attempts-per-block 4 \
+  --retry-delay-seconds 900 \
+  --attempt-log data/results/amended/collection_attempts.jsonl
 ```
 
 Repeat with start indices `11, 21, ..., 91`. Vary collection times across days.
@@ -95,7 +112,10 @@ failures, and any block count other than exactly 100.
 ```bash
 unset OPENSKY_CLIENT_ID
 unset OPENSKY_CLIENT_SECRET
-python -m opensky_streaming_dpmm.empirical run
+python -m opensky_streaming_dpmm.empirical run \
+  --blocks data/recorded_blocks/amended \
+  --lock data/results/amended/locked_config.json \
+  --output data/results/amended/factorial_results.csv
 ```
 
 Each block is replayed through both methods and nested 0%, 15%, and 30%
@@ -106,13 +126,16 @@ without recomputing finished cells.
 ## 6. Unlock the aggregate analysis
 
 ```bash
-python -m opensky_streaming_dpmm.empirical analyze
+python -m opensky_streaming_dpmm.empirical analyze \
+  --results data/results/amended/factorial_results.csv \
+  --lock data/results/amended/locked_config.json
 python scripts/build_site.py
 python -m pytest -q
 ```
 
 The analyzer refuses to run unless it finds exactly 100 blocks and 600 unique
-cells. On success it creates `data/empirical_summary.json` and changes
+cells produced under one verified lock, with finite primary endpoints and one
+content hash per block. On success it creates `data/empirical_summary.json` and changes
 `data/project_status.json` to `empirical_benchmark_complete`. Commit only those
 aggregate artifacts and the rebuilt page—not raw blocks, secrets, the lock file,
 or row-level results.
