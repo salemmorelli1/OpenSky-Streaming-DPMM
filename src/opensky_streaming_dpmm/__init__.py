@@ -5,4 +5,4 @@ package initializer side-effect free allows ``python -m ...engine`` to execute
 without importing the module twice.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"

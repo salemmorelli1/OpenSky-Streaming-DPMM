@@ -13,7 +13,9 @@ import gzip
 import hashlib
 import hmac
 import json
+import math
 import os
+import re
 import secrets
 import tempfile
 import time
@@ -32,6 +34,10 @@ TOKEN_URL = (
 )
 SCHEMA_VERSION = "opensky-empirical-block-v1"
 DEFAULT_BBOX = (49.0, 7.0, 54.0, 13.0)
+ICAO24_PATTERN = re.compile(r"^[0-9a-fA-F]{6}$")
+HEX64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+FORBIDDEN_IDENTITY_KEYS = {"icao24", "callsign", "origin_country", "squawk"}
+REQUIRED_MODEL_FIELDS = ("velocity", "true_track", "vertical_rate")
 
 
 class CollectionError(RuntimeError):
@@ -219,24 +225,44 @@ def sanitize_payload(payload: dict[str, Any], salt: bytes) -> dict[str, Any]:
         if None in (icao24, velocity, track, vertical_rate):
             rejected += 1
             continue
-        if float(velocity) < 0:
+        icao24 = str(icao24)
+        if not ICAO24_PATTERN.fullmatch(icao24):
             rejected += 1
             continue
+        try:
+            velocity = float(velocity)
+            track = float(track)
+            vertical_rate = float(vertical_rate)
+        except (TypeError, ValueError, OverflowError):
+            rejected += 1
+            continue
+        if not all(math.isfinite(value) for value in (velocity, track, vertical_rate)):
+            rejected += 1
+            continue
+        if velocity < 0:
+            rejected += 1
+            continue
+        category = row[17] if len(row) > 17 else None
+        if category is not None:
+            try:
+                category = int(category)
+            except (TypeError, ValueError, OverflowError):
+                category = None
         observations.append(
             {
-                "track_key": pseudonymize(str(icao24), salt),
+                "track_key": pseudonymize(icao24.lower(), salt),
                 "time_position": row[3],
                 "last_contact": row[4],
                 "longitude": row[5],
                 "latitude": row[6],
                 "baro_altitude": row[7],
                 "on_ground": row[8],
-                "velocity": float(velocity),
-                "true_track": float(track) % 360.0,
-                "vertical_rate": float(vertical_rate),
+                "velocity": velocity,
+                "true_track": track % 360.0,
+                "vertical_rate": vertical_rate,
                 "geo_altitude": row[13] if len(row) > 13 else None,
                 "position_source": row[16] if len(row) > 16 else None,
-                "category": row[17] if len(row) > 17 else None,
+                "category": category,
             }
         )
     return {
@@ -270,7 +296,7 @@ def read_verified_block(path: Path) -> dict[str, Any]:
         data = stream.read()
     value = json.loads(data)
     expected = value.get("integrity", {}).get("content_sha256")
-    if not expected:
+    if not isinstance(expected, str) or not HEX64_PATTERN.fullmatch(expected):
         raise CollectionError(f"missing content checksum: {path}")
     copy = dict(value)
     copy["integrity"] = dict(value["integrity"])
@@ -278,7 +304,76 @@ def read_verified_block(path: Path) -> dict[str, Any]:
     actual = sha256_bytes(canonical_json_bytes(copy))
     if not hmac.compare_digest(expected, actual):
         raise CollectionError(f"checksum mismatch: {path}")
+    _validate_block_structure(value, path)
     return value
+
+
+def _validate_block_structure(value: Any, path: Path) -> None:
+    """Fail closed on self-consistent but malformed empirical artifacts."""
+
+    label = str(path)
+    if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
+        raise CollectionError(f"invalid block schema: {label}")
+    phase = value.get("phase")
+    block_id = value.get("block_id")
+    if phase not in {"calibration", "formal"} or not isinstance(block_id, str):
+        raise CollectionError(f"invalid block identity: {label}")
+    if not re.fullmatch(rf"{phase}-[0-9]{{4}}", block_id):
+        raise CollectionError(f"block id does not match phase: {label}")
+
+    bbox = value.get("bbox")
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        raise CollectionError(f"invalid block bbox: {label}")
+    try:
+        lamin, lomin, lamax, lomax = map(float, bbox)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise CollectionError(f"invalid block bbox: {label}") from error
+    if not (-90 <= lamin < lamax <= 90 and -180 <= lomin < lomax <= 180):
+        raise CollectionError(f"invalid block bbox: {label}")
+
+    snapshots = value.get("snapshots")
+    count = value.get("snapshots_per_block")
+    if not isinstance(count, int) or count < 2 or not isinstance(snapshots, list):
+        raise CollectionError(f"invalid snapshot count: {label}")
+    if len(snapshots) != count:
+        raise CollectionError(f"snapshot count mismatch: {label}")
+    policy = value.get("acceptance_policy")
+    if not isinstance(policy, dict):
+        raise CollectionError(f"missing acceptance policy: {label}")
+    minimum = policy.get("minimum_eligible_states")
+    if not isinstance(minimum, int) or minimum < 1:
+        raise CollectionError(f"invalid eligibility policy: {label}")
+
+    for index, snapshot in enumerate(snapshots):
+        if not isinstance(snapshot, dict) or snapshot.get("snapshot_index") != index:
+            raise CollectionError(f"invalid snapshot index in {label}")
+        observations = snapshot.get("observations")
+        eligible = snapshot.get("eligible_observations")
+        if not isinstance(observations, list) or eligible != len(observations):
+            raise CollectionError(f"eligible count mismatch in {label}")
+        if eligible < minimum:
+            raise CollectionError(f"snapshot violates eligibility policy: {label}")
+        for observation in observations:
+            if not isinstance(observation, dict):
+                raise CollectionError(f"invalid observation in {label}")
+            if FORBIDDEN_IDENTITY_KEYS.intersection(observation):
+                raise CollectionError(f"direct identity field found in {label}")
+            track_key = observation.get("track_key")
+            if not isinstance(track_key, str) or not re.fullmatch(r"[0-9a-f]{24}", track_key):
+                raise CollectionError(f"invalid pseudonymous track key in {label}")
+            try:
+                model_values = [float(observation[field]) for field in REQUIRED_MODEL_FIELDS]
+            except (KeyError, TypeError, ValueError, OverflowError) as error:
+                raise CollectionError(f"invalid model observation in {label}") from error
+            if not all(math.isfinite(item) for item in model_values) or model_values[0] < 0:
+                raise CollectionError(f"non-finite model observation in {label}")
+
+    integrity = value.get("integrity")
+    raw_hashes = integrity.get("raw_response_sha256") if isinstance(integrity, dict) else None
+    if not isinstance(raw_hashes, list) or len(raw_hashes) != count:
+        raise CollectionError(f"invalid raw-response hash manifest: {label}")
+    if any(not isinstance(item, str) or not HEX64_PATTERN.fullmatch(item) for item in raw_hashes):
+        raise CollectionError(f"invalid raw-response hash: {label}")
 
 
 def append_attempt_record(path: Path, record: dict[str, Any]) -> None:

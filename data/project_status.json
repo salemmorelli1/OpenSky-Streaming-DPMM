@@ -1,7 +1,7 @@
 {
   "project": "OpenSky Streaming DPMM",
-  "version": "1.2.0",
-  "status": "bounded_retry_amendment_ready_recalibration_pending",
+  "version": "1.3.0",
+  "status": "integrity_hardening_ready_recalibration_pending",
   "data_source": "OpenSky Network state vectors",
   "observation_space": "R^2 x S^1",
   "methods": [

@@ -1,4 +1,5 @@
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,7 @@ from opensky_streaming_dpmm.collector import (
     CollectionConfig,
     CollectionError,
     atomic_write_gzip_json,
+    build_block,
     canonical_json_bytes,
     collect_blocks,
     read_verified_block,
@@ -63,20 +65,40 @@ class CollectorPrivacyTests(unittest.TestCase):
         self.assertEqual(result["eligible_observations"], 0)
         self.assertEqual(result["rejected_incomplete_states"], 1)
 
+    def test_nonfinite_and_malformed_identity_rows_are_rejected(self):
+        rows = [
+            state_row(speed=math.nan),
+            state_row(vertical_rate=math.inf),
+            state_row(icao="not-hex"),
+        ]
+        result = sanitize_payload({"time": 123, "states": rows}, b"x" * 32)
+        self.assertEqual(result["eligible_observations"], 0)
+        self.assertEqual(result["rejected_incomplete_states"], 3)
+
     def test_verified_block_detects_changes(self):
-        block = {
-            "schema_version": "opensky-empirical-block-v1",
-            "block_id": "calibration-0001",
-            "phase": "calibration",
-            "snapshots": [],
-            "integrity": {"raw_response_sha256": []},
-        }
-        block["integrity"]["content_sha256"] = sha256_bytes(canonical_json_bytes(block))
+        config = CollectionConfig("calibration", (49, 7, 54, 13), 2, 0.0, 2)
+        block = build_block(SequenceClient([2, 2]), config, b"x" * 32, "calibration-0001")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "block.json.gz"
             atomic_write_gzip_json(path, block)
             loaded = read_verified_block(path)
             self.assertEqual(loaded["block_id"], "calibration-0001")
+
+    def test_verified_block_rejects_self_consistent_identity_leak(self):
+        config = CollectionConfig("formal", (49, 7, 54, 13), 2, 0.0, 2)
+        block = build_block(SequenceClient([2, 2]), config, b"x" * 32, "formal-0001")
+        block["snapshots"][0]["observations"][0]["icao24"] = "abc123"
+        unsigned = dict(block)
+        unsigned["integrity"] = dict(block["integrity"])
+        unsigned["integrity"].pop("content_sha256")
+        block["integrity"]["content_sha256"] = sha256_bytes(
+            canonical_json_bytes(unsigned)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "block.json.gz"
+            atomic_write_gzip_json(path, block)
+            with self.assertRaisesRegex(CollectionError, "direct identity"):
+                read_verified_block(path)
 
     def test_collection_config_rejects_non_streaming_block(self):
         with self.assertRaises(ValueError):

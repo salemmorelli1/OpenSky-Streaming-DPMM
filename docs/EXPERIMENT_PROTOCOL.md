@@ -46,20 +46,21 @@ traces used in sensitivity analysis.
 
 ## Statistical analysis
 
-For a transformed response \(Y_{madb}\), with method \(m\), dropout level \(d\),
-and block \(b\), fit
+For a response \(Y_{mdb}\), with method \(m\), dropout level \(d\), and block
+\(b\), form the within-block architecture difference
 
 \[
-Y_{mdb}=\beta_0+\beta_A A_m+\beta_L L_d+\beta_Q Q_d+
-\beta_{AL}A_mL_d+\beta_{AQ}A_mQ_d+b_{0b}+b_{1b}A_m+\epsilon_{mdb}.
+D_{bd}=Y_{\mathrm{SMC},db}-Y_{\mathrm{VI},db}.
 \]
 
-Here \(A\) uses sum coding and \(L,Q\) are orthogonal linear and quadratic
-contrasts across 0%, 15%, and 30%. Block-specific random intercepts and, if the
-fit is stable, random architecture slopes account for pairing. Inference uses
-small-sample degrees-of-freedom correction or a block bootstrap. Endpoint-wise
-multiplicity is controlled with Holm adjustment; effect sizes and uncertainty
-intervals remain primary.
+The analyzer reports the three dropout-specific means of \(D_{bd}\), their
+architecture average, and orthogonal linear, quadratic, architecture-by-linear,
+and architecture-by-quadratic block contrasts. Paired t intervals treat the
+recorded block—not aircraft rows or particles—as the independent unit. Latency
+is log-transformed. Endpoint-wise multiplicity is controlled with Holm
+adjustment across the eight prespecified contrasts; effect sizes and uncertainty
+intervals remain primary. This estimator amendment is fixed before amended
+calibration or formal execution.
 
 ## Missingness and API outages
 
@@ -83,6 +84,8 @@ Ten calibration blocks are excluded from all formal contrasts. They select the
 smallest truncation in the fixed grid whose 95th-percentile residual-component
 weight is at most 0.01 and whose boundary-saturation rate is at most 0.05. The
 resulting lock records block hashes, \(K\), particle count, rejuvenation window,
-seeds, treatment levels, and endpoints. Formal execution requires exactly 100
-checksum-verified blocks and the public analyzer requires exactly 600 unique
-method-by-thinning rows.
+seeds, treatment levels, and endpoints. Its fingerprint is recomputed before
+formal replay and analysis, and every checkpoint row is bound to that fingerprint
+and one block checksum. Formal execution requires exactly 100 checksum-verified,
+structurally valid blocks and the public analyzer requires exactly 600 unique,
+successful rows with finite primary endpoints.

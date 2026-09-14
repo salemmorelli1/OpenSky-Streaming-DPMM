@@ -9,11 +9,11 @@ aircraft kinematics from the OpenSky Network. The project compares a truncated
 streaming variational Dirichlet-process mixture with a collapsed DP sequential
 Monte Carlo method under controlled observation thinning.
 
-**Release 1.2 status:** authenticated live-API connectivity has been verified on
-the local research machine. Release 1.2 adds a prespecified, bounded acquisition
-retry policy with a non-identifying JSONL audit trail. It does not expand the
-geographic box or retry without limit. The first 13 formal blocks collected under
-release 1.1 are retained as pilot material and excluded from the amended formal
+**Release 1.3 status:** authenticated live-API connectivity has been verified on
+the local research machine. Release 1.2 added a prespecified bounded acquisition
+retry policy; release 1.3 makes block, lock, checkpoint, endpoint, and aggregate
+provenance validation fail closed. The first 13 formal blocks collected under
+release 1.1 remain pilot material and are excluded from the amended formal
 benchmark. The 100-block/600-execution benchmark remains pending; no comparative
 performance result is fabricated.
 
@@ -70,6 +70,7 @@ Natural API missingness is recorded separately from treatment thinning.
 python -m venv .venv
 source .venv/Scripts/activate  # Windows Git Bash
 python -m pip install --upgrade pip
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -e ".[test,report]"
 
 python -m opensky_streaming_dpmm.engine
@@ -137,7 +138,8 @@ python -m opensky_streaming_dpmm.empirical run \
   --lock data/results/amended/locked_config.json \
   --output data/results/amended/factorial_results.csv
 python -m opensky_streaming_dpmm.empirical analyze \
-  --results data/results/amended/factorial_results.csv
+  --results data/results/amended/factorial_results.csv \
+  --lock data/results/amended/locked_config.json
 python scripts/build_site.py
 ```
 

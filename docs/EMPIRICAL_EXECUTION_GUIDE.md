@@ -6,6 +6,8 @@ Release 1.2 adds the bounded-retry amendment documented in
 `PROTOCOL_AMENDMENT_2026-09-01.md`. The authenticated one-snapshot command and
 the 13 release-1.1 formal blocks are pilot evidence only. The amended formal
 experiment begins in the separate `data/recorded_blocks/amended` directory.
+Release 1.3 additionally verifies the analysis-lock fingerprint at replay and
+analysis time and binds every checkpoint row to that lock and its block hash.
 
 The raw pseudonymized blocks, local pseudonym key, locked configuration, and
 row-level results remain ignored by Git. Only the completed aggregate summary
@@ -125,13 +127,15 @@ without recomputing finished cells.
 
 ```bash
 python -m opensky_streaming_dpmm.empirical analyze \
-  --results data/results/amended/factorial_results.csv
+  --results data/results/amended/factorial_results.csv \
+  --lock data/results/amended/locked_config.json
 python scripts/build_site.py
 python -m pytest -q
 ```
 
 The analyzer refuses to run unless it finds exactly 100 blocks and 600 unique
-cells. On success it creates `data/empirical_summary.json` and changes
+cells produced under one verified lock, with finite primary endpoints and one
+content hash per block. On success it creates `data/empirical_summary.json` and changes
 `data/project_status.json` to `empirical_benchmark_complete`. Commit only those
 aggregate artifacts and the rebuilt page—not raw blocks, secrets, the lock file,
 or row-level results.
