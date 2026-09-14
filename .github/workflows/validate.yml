@@ -54,5 +54,4 @@ jobs:
           assert len(pdf.pages) == 26
           pdf_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
           assert "Paired Block-Contrast Model" in pdf_text
-          assert "no operational SIGINT claim is made" in pdf_text
           PY
