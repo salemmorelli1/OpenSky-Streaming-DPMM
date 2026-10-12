@@ -5,8 +5,8 @@ type: software
 authors:
   - family-names: Morelli
     given-names: Salem
-version: 1.0.0
-date-released: 2026-08-29
+version: 1.4.0
+date-released: 2026-10-12
 license: MIT
 repository-code: "https://github.com/salemmorelli1/OpenSky-Streaming-DPMM"
 url: "https://salemmorelli1.github.io/OpenSky-Streaming-DPMM/"

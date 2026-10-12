@@ -38,13 +38,17 @@ def state_row(icao="abc123", speed=210.0, heading=359.0, vertical_rate=2.0):
 
 
 class SequenceClient:
-    def __init__(self, eligible_counts):
+    def __init__(self, eligible_counts, start_time=123):
         self.eligible_counts = iter(eligible_counts)
+        self.api_time = start_time
+        self.calls = 0
 
     def get_states(self, bbox):
         count = next(self.eligible_counts)
+        self.calls += 1
+        self.api_time += 5
         rows = [state_row(icao=f"{index:06x}") for index in range(count)]
-        return {"time": 123, "states": rows}, {"network_latency_ms": 1.0}
+        return {"time": self.api_time, "states": rows}, {"network_latency_ms": 1.0}
 
 
 class CollectorPrivacyTests(unittest.TestCase):
