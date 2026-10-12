@@ -11,7 +11,6 @@ reproducible experiment.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -23,6 +22,9 @@ import numpy as np
 import requests
 import torch
 from scipy.stats import norm, rankdata
+
+from .collector import CollectionError, OAuthSession, pseudonymize, sanitize_payload
+from .contracts import finite_real, integer
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -71,6 +73,7 @@ class OpenSkyClient:
             raise ValueError("bbox must be (lamin, lomin, lamax, lomax) in WGS84")
         if (client_id is None) != (client_secret is None):
             raise ValueError("provide both OAuth2 client_id and client_secret")
+        finite_real(timeout_seconds, "timeout_seconds", positive=True)
 
         self.params = {
             "lamin": lamin,
@@ -84,86 +87,56 @@ class OpenSkyClient:
         self.timeout_seconds = timeout_seconds
         self.salt = pseudonym_salt or os.urandom(32)
         self.session = requests.Session()
-        self._token: str | None = None
-        self._expires_at = 0.0
+        self._transport = OAuthSession(
+            client_id, client_secret, timeout_seconds, self.session
+        )
 
     def _headers(self) -> dict[str, str]:
-        if self.client_id is None:
-            return {}
-        if self._token is None or time.time() >= self._expires_at - 30.0:
-            response = self.session.post(
-                self.TOKEN_URL,
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                },
-                timeout=self.timeout_seconds,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            self._token = payload["access_token"]
-            self._expires_at = time.time() + float(payload.get("expires_in", 1800))
-        return {"Authorization": f"Bearer {self._token}"}
+        return self._transport._headers()
 
     def _pseudonym(self, icao24: str) -> str:
-        digest = hashlib.blake2b(
-            icao24.encode("ascii"), key=self.salt, digest_size=12
-        )
-        return digest.hexdigest()
+        return pseudonymize(icao24.lower(), self.salt)
 
     def fetch(self) -> OpenSkySnapshot:
-        started = time.perf_counter()
-        response = self.session.get(
-            self.API_URL,
-            params=self.params,
-            headers=self._headers(),
-            timeout=self.timeout_seconds,
-        )
-        network_ms = 1000.0 * (time.perf_counter() - started)
-        if response.status_code == 429:
-            retry = response.headers.get("X-Rate-Limit-Retry-After-Seconds", "unknown")
-            raise OpenSkyError(f"OpenSky rate limit exhausted; retry after {retry} s")
-        response.raise_for_status()
-        payload = response.json()
-        states = payload.get("states") or []
-
-        euclidean: list[list[float]] = []
-        headings: list[float] = []
-        keys: list[str] = []
-        categories: list[int] = []
-        for row in states:
-            if len(row) < 12:
-                continue
-            icao24, speed, track_deg, vertical_rate = row[0], row[9], row[10], row[11]
-            if None in (icao24, speed, track_deg, vertical_rate):
-                continue
-            if float(speed) < 0.0:
-                continue
-            euclidean.append(
-                [math.log1p(float(speed)), math.asinh(float(vertical_rate) / 5.0)]
-            )
-            headings.append(math.radians(float(track_deg) % 360.0))
-            keys.append(self._pseudonym(str(icao24)))
-            category = row[17] if len(row) > 17 and row[17] is not None else -1
-            categories.append(int(category))
+        self._transport.session = self.session
+        bbox = tuple(self.params[key] for key in ("lamin", "lomin", "lamax", "lomax"))
+        try:
+            payload, metadata = self._transport.get_states(bbox)
+            sanitized = sanitize_payload(payload, self.salt)
+        except CollectionError as error:
+            raise OpenSkyError(str(error)) from error
+        observations = sanitized["observations"]
+        euclidean = [
+            [math.log1p(row["velocity"]), math.asinh(row["vertical_rate"] / 5.0)]
+            for row in observations
+        ]
+        headings = [math.radians(row["true_track"]) for row in observations]
 
         x = torch.as_tensor(euclidean, dtype=DTYPE, device=DEVICE).reshape(-1, 2)
         theta = torch.as_tensor(headings, dtype=DTYPE, device=DEVICE)
         return OpenSkySnapshot(
-            time_position=int(payload.get("time", time.time())),
+            time_position=sanitized["api_time"],
             euclidean=x,
             heading=theta,
-            track_keys=tuple(keys),
-            categories=np.asarray(categories, dtype=np.int64),
-            network_latency_ms=network_ms,
+            track_keys=tuple(row["track_key"] for row in observations),
+            categories=np.asarray(
+                [
+                    -1 if row["category"] is None else row["category"]
+                    for row in observations
+                ],
+                dtype=np.int64,
+            ),
+            network_latency_ms=metadata["network_latency_ms"],
         )
 
 
 def nested_keep_mask(n: int, dropout_rate: float, block_seed: int) -> np.ndarray:
     """Create reproducible nested observation-thinning masks for a block."""
 
-    if not 0.0 <= dropout_rate < 1.0:
+    integer(n, "observation count")
+    integer(block_seed, "block_seed")
+    finite_real(dropout_rate, "dropout_rate")
+    if not dropout_rate < 1.0:
         raise ValueError("dropout_rate must lie in [0, 1)")
     uniforms = np.random.default_rng(block_seed).random(n)
     return uniforms >= dropout_rate
@@ -180,6 +153,42 @@ def _a1(x: torch.Tensor) -> torch.Tensor:
 
     ratio = torch.special.i1e(x) / torch.special.i0e(x)
     return torch.where(x == 0, torch.zeros_like(ratio), ratio)
+
+
+def _model_data(
+    x: torch.Tensor, theta: torch.Tensor, minimum: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not isinstance(x, torch.Tensor) or not isinstance(theta, torch.Tensor):
+        raise ValueError("model inputs must be tensors")
+    if x.ndim != 2 or x.shape[1] != 2 or theta.shape != (x.shape[0],):
+        raise ValueError("expected x=[N,2] and theta=[N]")
+    if x.shape[0] < minimum or x.is_complex() or theta.is_complex():
+        raise ValueError("insufficient or non-real model observations")
+    x = x.detach().to(device=DEVICE, dtype=DTYPE)
+    theta = theta.detach().to(device=DEVICE, dtype=DTYPE)
+    if not torch.isfinite(x).all() or not torch.isfinite(theta).all():
+        raise ValueError("model observations must be finite")
+    return x, theta
+
+
+def _base_moments(x: torch.Tensor, mean, variance) -> tuple[torch.Tensor, torch.Tensor]:
+    if (mean is None) != (variance is None):
+        raise ValueError("provide both fixed base mean and variance")
+    if mean is None:
+        return x.mean(0), x.var(0, unbiased=True).clamp_min(torch.finfo(DTYPE).eps)
+    m = torch.as_tensor(mean, dtype=DTYPE, device=DEVICE)
+    v = torch.as_tensor(variance, dtype=DTYPE, device=DEVICE)
+    if (
+        m.shape != (2,)
+        or v.shape != (2,)
+        or not torch.isfinite(m).all()
+        or not torch.isfinite(v).all()
+        or not (v > 0).all()
+    ):
+        raise ValueError(
+            "fixed Normal-Gamma base needs two finite means and positive variances"
+        )
+    return m.detach().clone(), v.detach().clone()
 
 
 class StreamingCircularDPMM:
@@ -199,9 +208,14 @@ class StreamingCircularDPMM:
         heading_kappa: float = 6.0,
         forgetting: float = 1.0,
         initialization_mass: float = 0.25,
+        base_mean: Iterable[float] | None = None,
+        base_variance: Iterable[float] | None = None,
     ) -> None:
-        if max_clusters < 2 or alpha <= 0 or heading_kappa <= 0:
-            raise ValueError("invalid mixture hyperparameters")
+        integer(max_clusters, "max_clusters", 2)
+        finite_real(alpha, "alpha", positive=True)
+        finite_real(heading_kappa, "heading_kappa", positive=True)
+        finite_real(initialization_mass, "initialization_mass", positive=True)
+        finite_real(forgetting, "forgetting", positive=True)
         if not 0.0 < forgetting <= 1.0:
             raise ValueError("forgetting must lie in (0, 1]")
         self.K = max_clusters
@@ -209,22 +223,25 @@ class StreamingCircularDPMM:
         self.heading_kappa = torch.tensor(heading_kappa, dtype=DTYPE, device=DEVICE)
         self.forgetting = float(forgetting)
         self.initialization_mass = float(initialization_mass)
+        self.base_mean, self.base_variance = base_mean, base_variance
         self.initialized = False
 
     def initialize(self, x: torch.Tensor, theta: torch.Tensor) -> None:
-        if x.ndim != 2 or x.shape[1] != 2 or theta.shape != (x.shape[0],):
-            raise ValueError("expected x=[N,2] and theta=[N]")
+        x, theta = _model_data(x, theta)
         if x.shape[0] < self.K:
-            raise ValueError("the calibration batch must contain at least K observations")
+            raise ValueError(
+                "the calibration batch must contain at least K observations"
+            )
 
-        self.m0 = x.mean(0)
-        empirical_var = x.var(0, unbiased=True).clamp_min(torch.finfo(DTYPE).eps)
+        self.m0, empirical_var = _base_moments(x, self.base_mean, self.base_variance)
         self.kappa0 = torch.tensor(0.05, dtype=DTYPE, device=DEVICE)
         self.a0 = torch.full((2,), 2.5, dtype=DTYPE, device=DEVICE)
         self.b0 = empirical_var * (self.a0 - 1.0)
 
         order = torch.argsort(x[:, 0])
-        positions = torch.linspace(0, x.shape[0] - 1, self.K, device=DEVICE).round().long()
+        positions = (
+            torch.linspace(0, x.shape[0] - 1, self.K, device=DEVICE).round().long()
+        )
         seeds = order[positions]
         centers = x[seeds]
         seed_theta = theta[seeds]
@@ -247,9 +264,7 @@ class StreamingCircularDPMM:
         self.stick_b = self.alpha + tail_counts
 
         self.post_kappa = self.kappa0 + self.counts[:, None]
-        self.post_mean = (
-            self.kappa0 * self.m0[None, :] + self.sums
-        ) / self.post_kappa
+        self.post_mean = (self.kappa0 * self.m0[None, :] + self.sums) / self.post_kappa
         self.post_a = self.a0[None, :] + 0.5 * self.counts[:, None]
         quadratic = (
             self.sumsq
@@ -293,8 +308,10 @@ class StreamingCircularDPMM:
                 (self.K - 1,), 1.0 / (1.0 + self.alpha), dtype=DTYPE, device=DEVICE
             )
             mean_1mv = torch.full(
-                (self.K - 1,), self.alpha / (1.0 + self.alpha),
-                dtype=DTYPE, device=DEVICE,
+                (self.K - 1,),
+                self.alpha / (1.0 + self.alpha),
+                dtype=DTYPE,
+                device=DEVICE,
             )
         weights = torch.empty(self.K, dtype=DTYPE, device=DEVICE)
         residual = torch.tensor(1.0, dtype=DTYPE, device=DEVICE)
@@ -330,6 +347,7 @@ class StreamingCircularDPMM:
     def responsibilities(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
         if not self.initialized:
             raise RuntimeError("call initialize on training data first")
+        x, theta = _model_data(x, theta, minimum=0)
         logits = self._expected_log_likelihood(x, theta)
         logits = logits + self.expected_log_weights()[None, :]
         return torch.softmax(logits, dim=1)
@@ -346,21 +364,24 @@ class StreamingCircularDPMM:
 
         if not self.initialized:
             raise RuntimeError("call initialize on a calibration batch first")
+        x, theta = _model_data(x, theta, minimum=0)
         degrees = 2.0 * self.post_a
         scale = torch.sqrt(
-            self.post_b * (self.post_kappa + 1.0)
-            / (self.post_a * self.post_kappa)
+            self.post_b * (self.post_kappa + 1.0) / (self.post_a * self.post_kappa)
         )
-        euclidean = torch.distributions.StudentT(
-            degrees[None, :, :],
-            self.post_mean[None, :, :],
-            scale[None, :, :],
-        ).log_prob(x[:, None, :]).sum(dim=2)
+        euclidean = (
+            torch.distributions.StudentT(
+                degrees[None, :, :],
+                self.post_mean[None, :, :],
+                scale[None, :, :],
+            )
+            .log_prob(x[:, None, :])
+            .sum(dim=2)
+        )
 
         unit = torch.stack([torch.cos(theta), torch.sin(theta)], dim=1)
         updated_eta = (
-            self.direction_eta[None, :, :]
-            + self.heading_kappa * unit[:, None, :]
+            self.direction_eta[None, :, :] + self.heading_kappa * unit[:, None, :]
         )
         circular = (
             _log_i0(torch.linalg.vector_norm(updated_eta, dim=2))
@@ -378,6 +399,7 @@ class StreamingCircularDPMM:
         )
 
     def partial_fit(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        x, theta = _model_data(x, theta)
         if not self.initialized:
             self.initialize(x, theta)
         responsibilities = self.responsibilities(x, theta)
@@ -474,24 +496,38 @@ class CollapsedDPSMC:
         resample_fraction: float = 0.5,
         rejuvenation_window: int = 24,
         seed: int = 2026,
+        base_mean: Iterable[float] | None = None,
+        base_variance: Iterable[float] | None = None,
     ) -> None:
-        if particles < 2 or calibration_x.shape[1] != 2:
-            raise ValueError("invalid particle configuration")
+        integer(particles, "particles", 2)
+        integer(rejuvenation_window, "rejuvenation_window", 0)
+        integer(seed, "seed")
+        finite_real(alpha, "alpha", positive=True)
+        finite_real(heading_kappa, "heading_kappa", positive=True)
+        finite_real(resample_fraction, "resample_fraction", positive=True)
+        if resample_fraction > 1:
+            raise ValueError("resample_fraction must lie in (0, 1]")
+        if not isinstance(calibration_x, torch.Tensor) or calibration_x.ndim != 2:
+            raise ValueError("expected calibration_x=[N,2]")
+        calibration_x, _ = _model_data(
+            calibration_x,
+            torch.zeros(calibration_x.shape[0], dtype=DTYPE, device=DEVICE),
+            2,
+        )
         self.P = particles
         self.alpha = float(alpha)
         self.heading_kappa = torch.tensor(heading_kappa, dtype=DTYPE, device=DEVICE)
         self.resample_threshold = resample_fraction * particles
         self.window = rejuvenation_window
         self.rng = torch.Generator(device=DEVICE).manual_seed(seed)
-        self.m0 = calibration_x.mean(0)
-        empirical_var = calibration_x.var(0, unbiased=True).clamp_min(
-            torch.finfo(DTYPE).eps
-        )
+        self.m0, empirical_var = _base_moments(calibration_x, base_mean, base_variance)
         self.kappa0 = torch.tensor(0.05, dtype=DTYPE, device=DEVICE)
         self.a0 = torch.full((2,), 2.5, dtype=DTYPE, device=DEVICE)
         self.b0 = empirical_var * (self.a0 - 1.0)
         initial_log_weight = -math.log(particles)
-        self.particles = [_Particle(log_weight=initial_log_weight) for _ in range(particles)]
+        self.particles = [
+            _Particle(log_weight=initial_log_weight) for _ in range(particles)
+        ]
         self.ess_history: list[float] = []
         self.log_score_history: list[float] = []
 
@@ -529,7 +565,9 @@ class CollapsedDPSMC:
         log_options = []
         for cluster_id in cluster_ids:
             stats = particle.clusters[cluster_id]
-            log_options.append(math.log(stats.n) + self._log_predictive(x, theta, stats))
+            log_options.append(
+                math.log(stats.n) + self._log_predictive(x, theta, stats)
+            )
         log_options.append(
             math.log(self.alpha) + self._log_predictive(x, theta, _ClusterStats.empty())
         )
@@ -583,6 +621,7 @@ class CollapsedDPSMC:
             particle.assignments[index] = new_id
 
     def partial_fit(self, x: torch.Tensor, theta: torch.Tensor) -> float:
+        x, theta = _model_data(x, theta)
         for observation, angle in zip(x, theta):
             previous_n = len(self.particles[0].assignments)
             denominator = math.log(previous_n + self.alpha)
@@ -606,13 +645,66 @@ class CollapsedDPSMC:
             )
             self.log_score_history.append(float(log_predictive.item()))
             weights, ess = self._normalize()
+            # Preserve the degeneracy that triggered resampling, rather than
+            # replacing it by the mechanically uniform post-resampling weights.
+            self.ess_history.append(ess)
             if ess < self.resample_threshold:
                 self._systematic_resample(weights)
                 for particle in self.particles:
                     self._rejuvenate(particle)
-                _, ess = self._normalize()
-            self.ess_history.append(ess)
+                self._normalize()
         return self.ess_history[-1] if self.ess_history else float(self.P)
+
+    def log_predictive(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        """Marginal densities under one frozen pre-snapshot posterior.
+
+        This query does not normalize in place, draw allocations, or update
+        histories. Every aircraft in a snapshot sees the same past information.
+        """
+
+        x, theta = _model_data(x, theta, minimum=0)
+        log_weights = torch.as_tensor(
+            [p.log_weight for p in self.particles], dtype=DTYPE, device=DEVICE
+        )
+        log_weights = log_weights - torch.logsumexp(log_weights, dim=0)
+        scores: list[torch.Tensor] = []
+        for particle in self.particles:
+            options = []
+            for stats in particle.clusters.values():
+                options.append(
+                    math.log(stats.n) + self._log_predictive_batch(x, theta, stats)
+                )
+            options.append(
+                math.log(self.alpha)
+                + self._log_predictive_batch(x, theta, _ClusterStats.empty())
+            )
+            scores.append(
+                torch.logsumexp(torch.stack(options), dim=0)
+                - math.log(len(particle.assignments) + self.alpha)
+            )
+        return torch.logsumexp(log_weights[:, None] + torch.stack(scores), dim=0)
+
+    def _log_predictive_batch(
+        self, x: torch.Tensor, theta: torch.Tensor, stats: _ClusterStats
+    ) -> torch.Tensor:
+        kappa, mean, a, b = self._posterior(stats)
+        scale = torch.sqrt(b * (kappa + 1.0) / (a * kappa))
+        euclidean = (
+            torch.distributions.StudentT(2.0 * a, mean, scale).log_prob(x).sum(dim=1)
+        )
+        eta = self.heading_kappa * stats.direction
+        unit = torch.stack([torch.cos(theta), torch.sin(theta)], dim=1)
+        circular = (
+            _log_i0(
+                torch.linalg.vector_norm(
+                    eta[None, :] + self.heading_kappa * unit, dim=1
+                )
+            )
+            - _log_i0(torch.linalg.vector_norm(eta))
+            - LOG_2PI
+            - _log_i0(self.heading_kappa)
+        )
+        return euclidean + circular
 
     def map_partition(self) -> np.ndarray:
         weights, _ = self._normalize()
@@ -636,6 +728,8 @@ def _split_chains(chains: np.ndarray) -> np.ndarray:
     chains = np.asarray(chains, dtype=float)
     if chains.ndim != 2 or chains.shape[0] < 4 or chains.shape[1] < 20:
         raise ValueError("publication diagnostics require at least 4 chains x 20 draws")
+    if not np.isfinite(chains).all():
+        raise ValueError("diagnostic chains must contain finite draws")
     half = chains.shape[1] // 2
     return np.concatenate([chains[:, :half], chains[:, -half:]], axis=0)
 
@@ -644,7 +738,14 @@ def _basic_rhat(chains: np.ndarray) -> float:
     m, n = chains.shape
     within = np.mean(np.var(chains, axis=1, ddof=1))
     between = n * np.var(np.mean(chains, axis=1), ddof=1)
+    if within == 0:
+        if between > 0:
+            return float("inf")
+        raise ValueError("constant diagnostic draws have no estimable variance")
     variance = ((n - 1.0) / n) * within + between / n
+
+    if variance <= 0:
+        raise ValueError("constant diagnostic draws have no estimable variance")
     return float(np.sqrt(variance / within))
 
 
@@ -676,6 +777,8 @@ def bulk_ess(chains: np.ndarray) -> float:
     variance = ((n - 1.0) / n) * within + between / n
 
     autocorrelation = [1.0]
+    if variance <= 0:
+        raise ValueError("constant diagnostic draws have no estimable variance")
     centered = z - z.mean(axis=1, keepdims=True)
     for lag in range(1, n):
         autocovariance = np.mean(
@@ -775,7 +878,9 @@ def run_live_example(dropout_levels: Iterable[float]) -> list[dict[str, float]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--live", action="store_true", help="run one descriptive live pull")
+    parser.add_argument(
+        "--live", action="store_true", help="run one descriptive live pull"
+    )
     args = parser.parse_args()
     result = run_live_example([0.0, 0.15, 0.30]) if args.live else self_test()
     print(json.dumps(result, indent=2))

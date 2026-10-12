@@ -29,15 +29,19 @@ coupling removes avoidable Monte Carlo variation from thinning contrasts.
 ## Blindness and leakage control
 
 Model features are log-speed, transformed vertical rate, and heading. A
-session-pseudonymous association key may be retained outside the feature matrix
+locally keyed pseudonymous association key may be retained outside the feature matrix
 for longitudinal alignment. OpenSky category codes, if present, are held out of
 inference and used only by the locked evaluator. Human-readable callsigns and
 aircraft identifiers are neither features nor public report fields.
 
 ## Outcomes
 
-Primary outcomes are mean prequential log score, synchronized compute latency
-per retained observation, and posterior cluster-count stability. Normalized
+Primary outcomes are mean pre-snapshot predictive log density, synchronized
+compute latency per retained observation, and final partition occupancy. The
+initial snapshot trains both methods and is unscored; later snapshots are
+scored before any current-snapshot update. Both methods share component-base
+moments frozen from excluded calibration data. See the dated release-1.4
+amendment for the final allocation, coverage, health, and timing definitions. Normalized
 mutual information against evaluation-only OpenSky categories is secondary
 because category coverage is incomplete and the field is not a behavioral
 ground truth. SMC particle ESS is an algorithmic health measure; rank-normalized
@@ -82,10 +86,16 @@ formal analysis. See `PROTOCOL_AMENDMENT_2026-09-01.md`.
 
 Ten calibration blocks are excluded from all formal contrasts. They select the
 smallest truncation in the fixed grid whose 95th-percentile residual-component
-weight is at most 0.01 and whose boundary-saturation rate is at most 0.05. The
-resulting lock records block hashes, \(K\), particle count, rejuvenation window,
+weight is at most 0.01 and whose boundary-saturation rate is at most 0.05. Each block uses the worst residual and saturation across all three thinning
+levels. The resulting v2 lock records the fixed component base, acquisition rule,
+implementation and compute environment, block hashes, \(K\), particle count, rejuvenation window,
 seeds, treatment levels, and endpoints. Its fingerprint is recomputed before
 formal replay and analysis, and every checkpoint row is bound to that fingerprint
 and one block checksum. Formal execution requires exactly 100 checksum-verified,
 structurally valid blocks and the public analyzer requires exactly 600 unique,
 successful rows with finite primary endpoints.
+
+Release 1.4 details are frozen in `PROTOCOL_AMENDMENT_2026-10-12.md`. Older
+locks cannot resume this implementation. Smaller software validation runs never
+unlock the public benchmark. Paired t intervals assume sufficiently independent
+blocks; collection timestamps alone do not prove that assumption.

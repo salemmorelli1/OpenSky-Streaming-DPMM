@@ -20,7 +20,9 @@ The corrected scope is:
 > is an aviation-surveillance methodology study, not a direct radar-pulse,
 > emitter, ELINT, or operational validation study.
 
-The companion implementation is OpenSky_Streaming_DPMM_Corrected.py.
+The implementation is the `src/opensky_streaming_dpmm` package. The release-1.4
+endpoint amendment and executable protocol supersede historical model proposals
+where they differ; see `PROTOCOL_AMENDMENT_2026-10-12.md`.
 
 ## 1. Defects corrected
 
@@ -306,38 +308,24 @@ If the treatment is network-update loss rather than observation thinning, the
 entire timestamped batch must be removed. These are distinct missing-data
 mechanisms.
 
-### 5.2 Mixed-effects model
+### 5.2 Frozen paired block contrasts
 
-Because every block receives every treatment, this is crossed repeated
-measures. With \(A_a\in\{-1/2,1/2\}\) and orthonormal linear and quadratic
-dropout contrasts \(B_{Lj},B_{Qj}\), a working model is
+The implemented confirmatory estimator is the paired block-contrast analysis
+in `EXPERIMENT_PROTOCOL.md`. For each endpoint, form SMC-minus-VI differences at
+each thinning level and report three specific architecture contrasts, the
+architecture average, linear and quadratic thinning contrasts, and their two
+architecture interactions. Latency is log-transformed. Paired t intervals use
+blocks as the independent unit, with endpoint-wise Holm adjustment across eight
+contrasts. The independence of separately scheduled blocks is a working
+assumption; timestamps alone do not prove it. Temporal coverage and possible
+serial dependence must be disclosed before interpreting results.
 
-\[
-\begin{aligned}
-g(Y_{kaj})={}&
-\beta_0+\beta_AA_a+\beta_LB_{Lj}+\beta_QB_{Qj}
-+\beta_{AL}A_aB_{Lj}+\beta_{AQ}A_aB_{Qj}\\
-&+b_{0k}+b_{Ak}A_a+b_{Lk}B_{Lj}+b_{Qk}B_{Qj}
-+\varepsilon_{kaj},
-\end{aligned}
-\]
-
-where \(b_k\sim\mathcal N(0,\Sigma_b)\). A maximal covariance may be unstable
-with six observations per block; preregister a parsimonious structure and
-justify simplification. Cell-specific residual scales or a heterogeneous
-repeated-measures covariance may be used when supported.
-
-Match the analysis to the endpoint:
-
-- log latency: Gaussian mixed model after separating network and compute time;
-- NMI in \([0,1]\): bootstrap or an appropriate bounded-response model;
-- held-out log predictive density: Gaussian working model if diagnostics allow;
-- particle ESS: SMC diagnostic only; and
-- R-hat and bulk ESS: MCMC diagnostics only, not cross-method responses.
-
-Category NMI should be secondary. Primary outcomes should include held-out log
-predictive density, partition stability under thinning, occupied-cluster
-uncertainty, and compute latency per retained observation.
+The three primary endpoints are pre-snapshot predictive log density, compute
+latency per retained observation, and final partition occupancy. Category NMI
+is secondary and reports its usable coverage. Particle ESS remains an SMC
+health metric; R-hat and bulk ESS apply only to genuine MCMC traces. Mixed
+models, bootstrap analyses, full posterior cluster-count uncertainty, and
+operational deadlines are not implemented confirmatory results.
 
 ## 6. Implementation
 
@@ -345,28 +333,31 @@ Install on Windows Git Bash:
 
     python -m venv .venv
     source .venv/Scripts/activate
-    python -m pip install --upgrade pip
-    python -m pip install torch numpy scipy requests
+    python -m pip install pip==26.2.1
+    python -m pip install torch==2.14.1+cpu --index-url https://download.pytorch.org/whl/cpu
+    python -m pip install -r requirements-ci-lock.txt
+    python -m pip install --no-deps --no-build-isolation -e .
 
 Run the deterministic offline smoke test:
 
-    python OpenSky_Streaming_DPMM_Corrected.py
+    python -m opensky_streaming_dpmm.engine
 
 Run one descriptive anonymous pull:
 
-    python OpenSky_Streaming_DPMM_Corrected.py --live
+    python -m opensky_streaming_dpmm.engine --live
 
 For authenticated access, set OAuth2 credentials in the environment rather
 than source code:
 
     export OPENSKY_CLIENT_ID=\"your-client-id\"
     export OPENSKY_CLIENT_SECRET=\"your-client-secret\"
-    python OpenSky_Streaming_DPMM_Corrected.py --live
+    python -m opensky_streaming_dpmm.engine --live
 
 One pull is a connectivity demonstration, not the factorial experiment. The
-publication experiment still requires a capture-and-replay controller, frozen
-block manifests, nested masks, at least four genuine MCMC runs whenever R-hat
-is reported, and preregistered endpoints and exclusions.
+publication experiment uses the collector and empirical runner, frozen block
+manifests, nested masks, a v2 lock, and the complete 600-cell gate. At least four
+genuine MCMC runs are required whenever sensitivity R-hat is reported; the
+main VI/SMC comparison does not claim MCMC convergence evidence.
 
 ## 7. Defensible claims
 

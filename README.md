@@ -9,13 +9,15 @@ aircraft kinematics from the OpenSky Network. The project compares a truncated
 streaming variational Dirichlet-process mixture with a collapsed DP sequential
 Monte Carlo method under controlled observation thinning.
 
-**Release 1.3 status:** authenticated live-API connectivity has been verified on
-the local research machine. Release 1.2 added a prespecified bounded acquisition
-retry policy; release 1.3 makes block, lock, checkpoint, endpoint, and aggregate
-provenance validation fail closed. The first 13 formal blocks collected under
-release 1.1 remain pilot material and are excluded from the amended formal
-benchmark. The 100-block/600-execution benchmark remains pending; no comparative
-performance result is fabricated.
+**Release 1.4 status:** the 100-block/600-execution benchmark remains pending.
+Authenticated connectivity was verified by the local operator on 2026-08-29;
+that historical smoke test is not a comparative result. This release corrects
+acquisition stopping, aligns pre-snapshot scoring and final partition occupancy,
+freezes the component base from excluded calibration data, and strengthens
+replay and publication integrity. It requires a fresh v2 calibration lock.
+The 13 release-1.1 formal blocks remain excluded pilot material.
+See [the audit](docs/REPLAY_INTEGRITY_AUDIT_2026-10-12.md) and
+[the endpoint amendment](docs/PROTOCOL_AMENDMENT_2026-10-12.md).
 
 ## Research question
 
@@ -69,9 +71,10 @@ Natural API missingness is recorded separately from treatment thinning.
 ```bash
 python -m venv .venv
 source .venv/Scripts/activate  # Windows Git Bash
-python -m pip install --upgrade pip
-python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-python -m pip install -e ".[test,report]"
+python -m pip install pip==26.2.1
+python -m pip install torch==2.14.1+cpu --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements-ci-lock.txt
+python -m pip install --no-deps --no-build-isolation -e ".[test,report]"
 
 python -m opensky_streaming_dpmm.engine
 python -m pytest
@@ -92,6 +95,7 @@ Rebuild publication artifacts:
 ```bash
 python scripts/build_site.py
 python scripts/build_report.py
+python scripts/verify_release.py
 ```
 
 ## Execute the empirical benchmark
@@ -106,17 +110,17 @@ amended acquisition rule:
 
 ```bash
 python -m opensky_streaming_dpmm.collector \
-  --output data/recorded_blocks/amended \
+  --output data/recorded_blocks/amended-v2 \
   --phase calibration --blocks 10 \
   --snapshots-per-block 6 --interval-seconds 5 \
   --spacing-seconds 900 --minimum-eligible-states 32 \
   --max-attempts-per-block 4 --retry-delay-seconds 900 \
-  --attempt-log data/results/amended/collection_attempts.jsonl
+  --attempt-log data/results/amended-v2/collection_attempts.jsonl
 
 unset OPENSKY_CLIENT_ID OPENSKY_CLIENT_SECRET
 python -m opensky_streaming_dpmm.empirical calibrate \
-  --blocks data/recorded_blocks/amended \
-  --output data/results/amended/locked_config.json
+  --blocks data/recorded_blocks/amended-v2 \
+  --output data/results/amended-v2/locked_config.json
 ```
 
 Then collect 100 separately scheduled formal blocks, execute the paired design,
@@ -125,21 +129,22 @@ and unlock the aggregate analysis:
 ```bash
 source .env.local
 python -m opensky_streaming_dpmm.collector \
-  --output data/recorded_blocks/amended \
+  --output data/recorded_blocks/amended-v2 \
   --phase formal --blocks 100 \
   --snapshots-per-block 6 --interval-seconds 5 \
   --spacing-seconds 900 --minimum-eligible-states 32 \
   --max-attempts-per-block 4 --retry-delay-seconds 900 \
-  --attempt-log data/results/amended/collection_attempts.jsonl
+  --attempt-log data/results/amended-v2/collection_attempts.jsonl
 
 unset OPENSKY_CLIENT_ID OPENSKY_CLIENT_SECRET
 python -m opensky_streaming_dpmm.empirical run \
-  --blocks data/recorded_blocks/amended \
-  --lock data/results/amended/locked_config.json \
-  --output data/results/amended/factorial_results.csv
+  --blocks data/recorded_blocks/amended-v2 \
+  --lock data/results/amended-v2/locked_config.json \
+  --output data/results/amended-v2/factorial_results.csv
 python -m opensky_streaming_dpmm.empirical analyze \
-  --results data/results/amended/factorial_results.csv \
-  --lock data/results/amended/locked_config.json
+  --blocks data/recorded_blocks/amended-v2 \
+  --results data/results/amended-v2/factorial_results.csv \
+  --lock data/results/amended-v2/locked_config.json
 python scripts/build_site.py
 ```
 

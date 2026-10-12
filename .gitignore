@@ -20,3 +20,6 @@ site-preview.png
 *.parquet
 *.pt
 *.pth
+
+.venv-*/
+.audit-build/

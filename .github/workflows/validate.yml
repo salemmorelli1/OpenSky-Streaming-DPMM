@@ -2,7 +2,7 @@ name: Validate statistical engine
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feature/**']
   pull_request:
   workflow_dispatch:
 
@@ -11,47 +11,53 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    name: CPU verification (${{ matrix.os }}, Python 3.12)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONHASHSEED: '0'
+      PYTHONUTF8: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
-          python-version: "3.12"
+          python-version: '3.12'
           cache: pip
-      - name: Install CPU PyTorch and project
+          cache-dependency-path: requirements-ci-lock.txt
+      - name: Install locked CPU dependencies and built wheel
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -e ".[test,report]"
-      - name: Test mathematical and API invariants
+          python -m pip install pip==26.2.1
+          python -m pip install torch==2.14.1+cpu --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements-ci-lock.txt
+          python -m build --wheel --no-isolation --outdir .audit-build/dist
+          python -m pip install --no-deps --force-reinstall .audit-build/dist/*.whl
+          python -m pip check
+          python -c "import torch; assert torch.__version__ == '2.14.1+cpu'; assert torch.version.cuda is None"
+      - name: Test mathematics, acquisition, replay, and publication gates
         run: |
           python -m py_compile src/opensky_streaming_dpmm/*.py scripts/*.py tests/*.py
           python -m ruff check src scripts tests --select F,E9,B023
           python -m pytest
-      - name: Run deterministic smoke benchmark
-        run: python -m opensky_streaming_dpmm.engine
-      - name: Rebuild publication artifacts
+      - name: Run offline engine and command-line smoke checks
+        run: |
+          python -m opensky_streaming_dpmm.engine
+          opensky-dpmm
+          opensky-collect --help
+          opensky-experiment --help
+      - name: Rebuild and audit publication artifacts
         run: |
           python scripts/build_site.py
-          python scripts/build_report.py
+          python scripts/build_report.py --output .audit-build/OpenSky_Streaming_DPMM_APA_Report.pdf
+          python scripts/verify_release.py
+          python scripts/verify_release.py --report .audit-build/OpenSky_Streaming_DPMM_APA_Report.pdf
           git diff --exit-code -- index.html
-      - name: Audit artifact boundaries
-        run: |
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          from pypdf import PdfReader
-
-          status = json.loads(Path("data/project_status.json").read_text())
-          assert status["empirical_results_available"] is False
-          assert status["authenticated_live_api_verified"] is True
-          html = Path("index.html").read_text(encoding="utf-8")
-          assert "No operational SIGINT claim" in html
-          assert "Execution pipeline ready" in html
-          assert "No public empirical summary before 600 unique successful rows" in html
-          pdf = PdfReader("report/OpenSky_Streaming_DPMM_APA_Report.pdf")
-          assert len(pdf.pages) == 26
-          pdf_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-          assert "Paired Block-Contrast Model" in pdf_text
-          PY

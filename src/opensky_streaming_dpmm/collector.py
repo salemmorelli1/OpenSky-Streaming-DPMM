@@ -27,6 +27,8 @@ from typing import Any
 
 import requests
 
+from .contracts import collection_contract, finite_real, integer
+
 API_URL = "https://opensky-network.org/api/states/all"
 TOKEN_URL = (
     "https://auth.opensky-network.org/auth/realms/opensky-network/"
@@ -82,12 +84,21 @@ class CollectionConfig:
         lamin, lomin, lamax, lomax = self.bbox
         if not (-90 <= lamin < lamax <= 90 and -180 <= lomin < lomax <= 180):
             raise ValueError("bbox must be (lamin, lomin, lamax, lomax)")
-        if self.snapshots_per_block < 2:
-            raise ValueError("a streaming block requires at least two snapshots")
-        if self.interval_seconds < 0 or self.minimum_eligible_states < 1:
-            raise ValueError("invalid timing or eligibility threshold")
-        if self.max_attempts_per_block < 1 or self.retry_delay_seconds < 0:
-            raise ValueError("invalid bounded-retry policy")
+        integer(self.snapshots_per_block, "snapshots_per_block", 2)
+        integer(self.minimum_eligible_states, "minimum_eligible_states", 1)
+        integer(self.max_attempts_per_block, "max_attempts_per_block", 1)
+        finite_real(self.interval_seconds, "interval_seconds")
+        finite_real(self.retry_delay_seconds, "retry_delay_seconds")
+
+    def contract(self) -> dict[str, Any]:
+        return {
+            "bbox": list(self.bbox),
+            "snapshots_per_block": self.snapshots_per_block,
+            "interval_seconds": self.interval_seconds,
+            "minimum_eligible_states": self.minimum_eligible_states,
+            "max_attempts_per_block": self.max_attempts_per_block,
+            "retry_delay_seconds": self.retry_delay_seconds,
+        }
 
 
 class OAuthSession:
@@ -102,6 +113,7 @@ class OAuthSession:
     ) -> None:
         if (client_id is None) != (client_secret is None):
             raise ValueError("provide both OpenSky OAuth values or neither")
+        finite_real(timeout_seconds, "timeout_seconds", positive=True)
         self.client_id = client_id
         self.client_secret = client_secret
         self.timeout_seconds = timeout_seconds
@@ -124,8 +136,22 @@ class OAuthSession:
             )
             response.raise_for_status()
             payload = response.json()
-            self._token = str(payload["access_token"])
-            self._expires_at = time.time() + float(payload.get("expires_in", 1800))
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(payload.get("access_token"), str)
+                or not payload["access_token"]
+            ):
+                raise CollectionError("OpenSky token response has no access token")
+            try:
+                lifetime = finite_real(
+                    payload.get("expires_in", 1800), "token lifetime", positive=True
+                )
+            except ValueError as error:
+                raise CollectionError(
+                    "OpenSky token response has invalid expiry"
+                ) from error
+            self._token = payload["access_token"]
+            self._expires_at = time.time() + lifetime
         return {"Authorization": f"Bearer {self._token}"}
 
     def get_states(
@@ -145,6 +171,22 @@ class OAuthSession:
             headers=self._headers(),
             timeout=self.timeout_seconds,
         )
+        if response.status_code == 401 and self.client_id is not None:
+            # A server may revoke a token before its advertised expiry. Retry
+            # authentication once, without turning acquisition into an open loop.
+            self._token = None
+            response = self.session.get(
+                API_URL,
+                params={
+                    "lamin": lamin,
+                    "lomin": lomin,
+                    "lamax": lamax,
+                    "lomax": lomax,
+                    "extended": 1,
+                },
+                headers=self._headers(),
+                timeout=self.timeout_seconds,
+            )
         elapsed_ms = 1000.0 * (time.perf_counter() - started)
         if response.status_code == 429:
             retry = response.headers.get(
@@ -174,7 +216,11 @@ def _safe_int(value: str | None) -> int | None:
 
 def canonical_json_bytes(value: Any) -> bytes:
     return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
     ).encode("utf-8")
 
 
@@ -215,18 +261,32 @@ def pseudonymize(icao24: str, salt: bytes) -> str:
 def sanitize_payload(payload: dict[str, Any], salt: bytes) -> dict[str, Any]:
     """Remove direct identity fields before any block is written to disk."""
 
+    if not isinstance(payload, dict):
+        raise CollectionError("OpenSky response must be an object")
+    try:
+        api_time = integer(payload.get("time"), "OpenSky response time", 1)
+    except ValueError as error:
+        raise CollectionError(str(error)) from error
+    states = payload.get("states")
+    if states is None:
+        states = []
+    if not isinstance(states, list):
+        raise CollectionError("OpenSky states must be a list or null")
     observations: list[dict[str, Any]] = []
     rejected = 0
-    for row in payload.get("states") or []:
-        if len(row) < 12:
+    seen: set[str] = set()
+    for row in states:
+        if not isinstance(row, (list, tuple)) or len(row) < 12:
             rejected += 1
             continue
         icao24, velocity, track, vertical_rate = row[0], row[9], row[10], row[11]
         if None in (icao24, velocity, track, vertical_rate):
             rejected += 1
             continue
-        icao24 = str(icao24)
-        if not ICAO24_PATTERN.fullmatch(icao24):
+        if not isinstance(icao24, str) or not ICAO24_PATTERN.fullmatch(icao24):
+            rejected += 1
+            continue
+        if any(isinstance(item, bool) for item in (velocity, track, vertical_rate)):
             rejected += 1
             continue
         try:
@@ -242,15 +302,20 @@ def sanitize_payload(payload: dict[str, Any], salt: bytes) -> dict[str, Any]:
         if velocity < 0:
             rejected += 1
             continue
+        identity = icao24.lower()
+        if identity in seen:
+            rejected += 1
+            continue
+        seen.add(identity)
         category = row[17] if len(row) > 17 else None
         if category is not None:
             try:
-                category = int(category)
-            except (TypeError, ValueError, OverflowError):
+                category = integer(category, "category", 0, 20)
+            except ValueError:
                 category = None
         observations.append(
             {
-                "track_key": pseudonymize(icao24.lower(), salt),
+                "track_key": pseudonymize(identity, salt),
                 "time_position": row[3],
                 "last_contact": row[4],
                 "longitude": row[5],
@@ -266,7 +331,7 @@ def sanitize_payload(payload: dict[str, Any], salt: bytes) -> dict[str, Any]:
             }
         )
     return {
-        "api_time": int(payload.get("time", time.time())),
+        "api_time": api_time,
         "eligible_observations": len(observations),
         "rejected_incomplete_states": rejected,
         "observations": observations,
@@ -280,9 +345,12 @@ def atomic_write_gzip_json(path: Path, value: dict[str, Any]) -> str:
     descriptor, temporary = tempfile.mkstemp(prefix=path.name, dir=path.parent)
     os.close(descriptor)
     try:
-        with Path(temporary).open("wb") as raw_stream, gzip.GzipFile(
-            filename="", mode="wb", fileobj=raw_stream, mtime=0
-        ) as stream:
+        with (
+            Path(temporary).open("wb") as raw_stream,
+            gzip.GzipFile(
+                filename="", mode="wb", fileobj=raw_stream, mtime=0
+            ) as stream,
+        ):
             stream.write(canonical)
         os.replace(temporary, path)
     except Exception:
@@ -294,14 +362,22 @@ def atomic_write_gzip_json(path: Path, value: dict[str, Any]) -> str:
 def read_verified_block(path: Path) -> dict[str, Any]:
     with gzip.open(path, "rb") as stream:
         data = stream.read()
-    value = json.loads(data)
-    expected = value.get("integrity", {}).get("content_sha256")
+    try:
+        value = json.loads(data)
+    except (ValueError, UnicodeError) as error:
+        raise CollectionError(f"invalid block JSON: {path}") from error
+    if not isinstance(value, dict) or not isinstance(value.get("integrity"), dict):
+        raise CollectionError(f"invalid block integrity object: {path}")
+    expected = value["integrity"].get("content_sha256")
     if not isinstance(expected, str) or not HEX64_PATTERN.fullmatch(expected):
         raise CollectionError(f"missing content checksum: {path}")
     copy = dict(value)
     copy["integrity"] = dict(value["integrity"])
     copy["integrity"].pop("content_sha256", None)
-    actual = sha256_bytes(canonical_json_bytes(copy))
+    try:
+        actual = sha256_bytes(canonical_json_bytes(copy))
+    except (ValueError, TypeError) as error:
+        raise CollectionError(f"invalid non-finite block JSON: {path}") from error
     if not hmac.compare_digest(expected, actual):
         raise CollectionError(f"checksum mismatch: {path}")
     _validate_block_structure(value, path)
@@ -320,6 +396,18 @@ def _validate_block_structure(value: Any, path: Path) -> None:
         raise CollectionError(f"invalid block identity: {label}")
     if not re.fullmatch(rf"{phase}-[0-9]{{4}}", block_id):
         raise CollectionError(f"block id does not match phase: {label}")
+
+    def check_identity_fields(item: Any) -> None:
+        if isinstance(item, dict):
+            if FORBIDDEN_IDENTITY_KEYS.intersection(item):
+                raise CollectionError(f"direct identity field found in {label}")
+            for child in item.values():
+                check_identity_fields(child)
+        elif isinstance(item, list):
+            for child in item:
+                check_identity_fields(child)
+
+    check_identity_fields(value)
 
     bbox = value.get("bbox")
     if not isinstance(bbox, list) or len(bbox) != 4:
@@ -341,38 +429,92 @@ def _validate_block_structure(value: Any, path: Path) -> None:
     if not isinstance(policy, dict):
         raise CollectionError(f"missing acceptance policy: {label}")
     minimum = policy.get("minimum_eligible_states")
-    if not isinstance(minimum, int) or minimum < 1:
-        raise CollectionError(f"invalid eligibility policy: {label}")
+    try:
+        integer(count, "snapshots_per_block", 2)
+        integer(minimum, "minimum_eligible_states", 1)
+        maximum = integer(
+            policy.get("max_attempts_per_block"), "max_attempts_per_block", 1
+        )
+        integer(policy.get("accepted_attempt"), "accepted_attempt", 1, maximum)
+        finite_real(value.get("interval_seconds"), "interval_seconds")
+        finite_real(policy.get("retry_delay_seconds"), "retry_delay_seconds")
+    except ValueError as error:
+        raise CollectionError(
+            f"invalid acquisition policy: {label}: {error}"
+        ) from error
 
+    previous_time = 0
     for index, snapshot in enumerate(snapshots):
         if not isinstance(snapshot, dict) or snapshot.get("snapshot_index") != index:
             raise CollectionError(f"invalid snapshot index in {label}")
+        try:
+            api_time = integer(snapshot.get("api_time"), "snapshot api_time", 1)
+        except ValueError as error:
+            raise CollectionError(f"invalid snapshot timestamp in {label}") from error
+        if api_time <= previous_time:
+            raise CollectionError(
+                f"snapshot timestamps must increase strictly in {label}"
+            )
+        previous_time = api_time
         observations = snapshot.get("observations")
         eligible = snapshot.get("eligible_observations")
+        try:
+            integer(eligible, "eligible_observations")
+            integer(snapshot.get("snapshot_index"), "snapshot_index")
+        except ValueError as error:
+            raise CollectionError(
+                f"invalid snapshot count or index in {label}"
+            ) from error
         if not isinstance(observations, list) or eligible != len(observations):
             raise CollectionError(f"eligible count mismatch in {label}")
         if eligible < minimum:
             raise CollectionError(f"snapshot violates eligibility policy: {label}")
+        seen_keys: set[str] = set()
         for observation in observations:
             if not isinstance(observation, dict):
                 raise CollectionError(f"invalid observation in {label}")
             if FORBIDDEN_IDENTITY_KEYS.intersection(observation):
                 raise CollectionError(f"direct identity field found in {label}")
             track_key = observation.get("track_key")
-            if not isinstance(track_key, str) or not re.fullmatch(r"[0-9a-f]{24}", track_key):
+            if not isinstance(track_key, str) or not re.fullmatch(
+                r"[0-9a-f]{24}", track_key
+            ):
                 raise CollectionError(f"invalid pseudonymous track key in {label}")
+            if track_key in seen_keys:
+                raise CollectionError(
+                    f"duplicate aircraft within a snapshot in {label}"
+                )
+            seen_keys.add(track_key)
             try:
-                model_values = [float(observation[field]) for field in REQUIRED_MODEL_FIELDS]
+                model_values = [
+                    float(observation[field]) for field in REQUIRED_MODEL_FIELDS
+                ]
             except (KeyError, TypeError, ValueError, OverflowError) as error:
-                raise CollectionError(f"invalid model observation in {label}") from error
-            if not all(math.isfinite(item) for item in model_values) or model_values[0] < 0:
+                raise CollectionError(
+                    f"invalid model observation in {label}"
+                ) from error
+            if (
+                not all(math.isfinite(item) for item in model_values)
+                or model_values[0] < 0
+            ):
                 raise CollectionError(f"non-finite model observation in {label}")
+            category = observation.get("category")
+            if category is not None:
+                try:
+                    integer(category, "category", 0, 20)
+                except ValueError as error:
+                    raise CollectionError(f"invalid category in {label}") from error
 
     integrity = value.get("integrity")
-    raw_hashes = integrity.get("raw_response_sha256") if isinstance(integrity, dict) else None
+    raw_hashes = (
+        integrity.get("raw_response_sha256") if isinstance(integrity, dict) else None
+    )
     if not isinstance(raw_hashes, list) or len(raw_hashes) != count:
         raise CollectionError(f"invalid raw-response hash manifest: {label}")
-    if any(not isinstance(item, str) or not HEX64_PATTERN.fullmatch(item) for item in raw_hashes):
+    if any(
+        not isinstance(item, str) or not HEX64_PATTERN.fullmatch(item)
+        for item in raw_hashes
+    ):
         raise CollectionError(f"invalid raw-response hash: {label}")
 
 
@@ -398,8 +540,17 @@ def build_block(
     raw_hashes: list[str] = []
     for index in range(config.snapshots_per_block):
         raw, transport = client.get_states(config.bbox)
-        raw_hashes.append(sha256_bytes(canonical_json_bytes(raw)))
+        try:
+            raw_hashes.append(sha256_bytes(canonical_json_bytes(raw)))
+        except (ValueError, TypeError) as error:
+            raise CollectionError(
+                "OpenSky response contains invalid JSON values"
+            ) from error
         sanitized = sanitize_payload(raw, salt)
+        if snapshots and sanitized["api_time"] <= snapshots[-1]["api_time"]:
+            raise CollectionError(
+                f"{block_id} snapshot timestamps must increase strictly"
+            )
         if sanitized["eligible_observations"] < config.minimum_eligible_states:
             eligible = int(sanitized["eligible_observations"])
             raise EligibilityError(
@@ -407,10 +558,7 @@ def build_block(
                 index,
                 eligible,
                 config.minimum_eligible_states,
-                [
-                    int(snapshot["eligible_observations"])
-                    for snapshot in snapshots
-                ]
+                [int(snapshot["eligible_observations"]) for snapshot in snapshots]
                 + [eligible],
             )
         sanitized["snapshot_index"] = index
@@ -444,6 +592,7 @@ def build_block(
             "content_sha256": None,
         },
     }
+    _validate_block_structure(block, Path(block_id))
     integrity_input = dict(block)
     integrity_input["integrity"] = dict(block["integrity"])
     integrity_input["integrity"].pop("content_sha256")
@@ -466,15 +615,28 @@ def collect_blocks(
 ) -> list[Path]:
     """Collect missing block indices and verify every completed artifact."""
 
-    if count < 1 or start_index < 1 or spacing_seconds < 0:
-        raise ValueError("invalid block count, start index, or spacing")
+    integer(count, "count", 1)
+    integer(start_index, "start_index", 1, 9999)
+    integer(start_index + count - 1, "last block index", 1, 9999)
+    finite_real(spacing_seconds, "spacing_seconds")
     client = client or OAuthSession(
         os.getenv("OPENSKY_CLIENT_ID"), os.getenv("OPENSKY_CLIENT_SECRET")
     )
-    salt = load_or_create_salt(
-        salt_path or Path("data/private/pseudonym_salt.bin")
-    )
+    salt = load_or_create_salt(salt_path or Path("data/private/pseudonym_salt.bin"))
     output_dir.mkdir(parents=True, exist_ok=True)
+    latest_api_time = 0
+    for existing_path in sorted(output_dir.glob(f"{config.phase}-*.json.gz")):
+        existing = read_verified_block(existing_path)
+        if existing_path.name != f"{existing['block_id']}.json.gz":
+            raise CollectionError("existing block filename does not match its identity")
+        if collection_contract(existing) != config.contract():
+            raise CollectionError(
+                "existing block uses a different acquisition protocol"
+            )
+        first_time = existing["snapshots"][0]["api_time"]
+        if first_time <= latest_api_time:
+            raise CollectionError("existing block windows overlap or are out of order")
+        latest_api_time = existing["snapshots"][-1]["api_time"]
     completed: list[Path] = []
     indices = range(start_index, start_index + count)
     for offset, block_index in enumerate(indices):
@@ -490,6 +652,11 @@ def collect_blocks(
             attempted_at = datetime.now(timezone.utc).isoformat()
             try:
                 block = build_block(client, config, salt, block_id, attempt)
+                if block["snapshots"][0]["api_time"] <= latest_api_time:
+                    raise CollectionError(
+                        f"{block_id} overlaps a previously accepted API window"
+                    )
+                break
             except (CollectionError, requests.RequestException) as error:
                 record: dict[str, Any] = {
                     "schema": "opensky-collection-attempt-v1",
@@ -524,6 +691,7 @@ def collect_blocks(
             raise AssertionError("bounded retry loop ended without a block")
         atomic_write_gzip_json(destination, block)
         read_verified_block(destination)
+        latest_api_time = block["snapshots"][-1]["api_time"]
         if attempt_log_path is not None:
             append_attempt_record(
                 attempt_log_path,
